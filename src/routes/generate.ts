@@ -86,10 +86,14 @@ async function resolveReferenceImages(
   return parts;
 }
 
+const DEFAULT_MODEL = 'gemini-3-pro-image-preview';
+const ALLOWED_MODELS = ['gemini-3-pro-image-preview', 'gemini-3.1-flash-image-preview'] as const;
+
 type GenerateBody = {
   prompt: string;
   aspectRatio?: string;
   imageSize?: string;
+  model?: string;
   referenceImages?: string[];
   referenceImageUrls?: string[];
 };
@@ -104,7 +108,10 @@ type GenerateResult = {
 };
 
 async function doGenerate(body: GenerateBody): Promise<GenerateResult> {
-  const { prompt, aspectRatio, imageSize, referenceImages, referenceImageUrls } = body;
+  const { prompt, aspectRatio, imageSize, model: modelParam, referenceImages, referenceImageUrls } = body;
+  const model = ALLOWED_MODELS.includes(modelParam as (typeof ALLOWED_MODELS)[number])
+    ? modelParam
+    : DEFAULT_MODEL;
   const startTime = Date.now();
 
     const refCount = (referenceImages?.length ?? 0) + (referenceImageUrls?.length ?? 0);
@@ -159,7 +166,7 @@ async function doGenerate(body: GenerateBody): Promise<GenerateResult> {
 
       try {
         laoRes = await fetch(
-          `${LAOZHANG_API_URL}/v1beta/models/gemini-3-pro-image-preview:generateContent`,
+          `${LAOZHANG_API_URL}/v1beta/models/${model}:generateContent`,
           {
             method: 'POST',
             headers: {
@@ -277,6 +284,7 @@ export async function generateHandler(req: Request, res: Response): Promise<void
     prompt?: string;
     aspectRatio?: string;
     imageSize?: string;
+    model?: string;
     referenceImages?: string[];
     referenceImageUrls?: string[];
   };
