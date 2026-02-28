@@ -2,7 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 
-import { generateHandler } from './routes/generate.js';
+import { generateHandler, generateStatusHandler } from './routes/generate.js';
 import { enhancePromptHandler } from './routes/enhance-prompt.js';
 
 const app = express();
@@ -42,6 +42,7 @@ app.get('/health', (_req, res) => {
 
 // API routes (same paths as Vercel for frontend compatibility)
 app.post('/api/generate', generateHandler);
+app.get('/api/generate/status/:jobId', generateStatusHandler);
 app.post('/api/enhance-prompt', enhancePromptHandler);
 
 app.listen(PORT, () => {

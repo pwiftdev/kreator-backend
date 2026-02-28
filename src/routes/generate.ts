@@ -1,6 +1,7 @@
 import type { Request, Response } from 'express';
 import sharp from 'sharp';
 import { createClient } from '@supabase/supabase-js';
+import { createJob, getJob, setJobError, setJobResult } from '../jobs.js';
 
 const LAOZHANG_API_KEY = process.env.LAOZHANG_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -85,39 +86,26 @@ async function resolveReferenceImages(
   return parts;
 }
 
-export async function generateHandler(req: Request, res: Response): Promise<void> {
-  if (req.method !== 'POST') {
-    res.status(405).json({ error: 'Method not allowed' });
-    return;
-  }
+type GenerateBody = {
+  prompt: string;
+  aspectRatio?: string;
+  imageSize?: string;
+  referenceImages?: string[];
+  referenceImageUrls?: string[];
+};
 
-  if (!LAOZHANG_API_KEY || LAOZHANG_API_KEY === 'sk-YOUR_API_KEY_HERE') {
-    console.error('[generate] LAOZHANG_API_KEY not set');
-    res.status(500).json({
-      error: 'Server configuration error: LAOZHANG_API_KEY not set. Add it in Heroku Config Vars.',
-    });
-    return;
-  }
+type GenerateResult = {
+  url?: string;
+  storagePath?: string;
+  base64Data?: string;
+  prompt: string;
+  aspectRatio: string;
+  imageSize: string;
+};
 
+async function doGenerate(body: GenerateBody): Promise<GenerateResult> {
+  const { prompt, aspectRatio, imageSize, referenceImages, referenceImageUrls } = body;
   const startTime = Date.now();
-  console.log('[generate] Request received');
-
-  try {
-    const body = req.body as {
-      prompt?: string;
-      aspectRatio?: string;
-      imageSize?: string;
-      referenceImages?: string[];
-      referenceImageUrls?: string[];
-    };
-
-    const { prompt, aspectRatio, imageSize, referenceImages, referenceImageUrls } = body;
-
-    if (!prompt || typeof prompt !== 'string') {
-      console.warn('[generate] Missing or invalid prompt');
-      res.status(400).json({ error: 'Missing or invalid prompt' });
-      return;
-    }
 
     const refCount = (referenceImages?.length ?? 0) + (referenceImageUrls?.length ?? 0);
     console.log(`[generate] prompt="${prompt.slice(0, 60)}${prompt.length > 60 ? '...' : ''}" aspect=${aspectRatio || '3:2'} size=${imageSize || '1K'} refs=${refCount}`);
@@ -209,8 +197,7 @@ export async function generateHandler(req: Request, res: Response): Promise<void
       const errorData = (await laoRes.json().catch(() => ({}))) as { error?: { message?: string } };
       const errMsg = errorData.error?.message || `LaoZhang API error: ${laoRes.status} ${laoRes.statusText}`;
       console.error('[generate] LaoZhang API error:', laoRes.status, errMsg);
-      res.status(laoRes.status).json({ error: errMsg });
-      return;
+      throw new Error(errMsg);
     }
 
     const result = (await laoRes.json()) as {
@@ -222,8 +209,7 @@ export async function generateHandler(req: Request, res: Response): Promise<void
 
     if (!base64Data) {
       console.error('[generate] No image data in LaoZhang response');
-      res.status(500).json({ error: 'No image data returned from LaoZhang API' });
-      return;
+      throw new Error('No image data returned from LaoZhang API');
     }
 
     const elapsed = Date.now() - startTime;
@@ -242,41 +228,101 @@ export async function generateHandler(req: Request, res: Response): Promise<void
 
         if (uploadError) {
           console.error('[generate] Supabase upload failed, falling back to base64:', uploadError.message);
-          res.status(200).json({
+          return {
             base64Data,
             prompt,
             aspectRatio: aspectRatio || '3:2',
             imageSize: imageSize || '1K',
-          });
-          return;
+          };
         }
 
         const { data: urlData } = supabase.storage.from(BUCKET_NAME).getPublicUrl(storagePath);
         const publicUrl = urlData.publicUrl;
         console.log(`[generate] Uploaded to Supabase, returning URL (${Date.now() - startTime}ms total)`);
-        res.status(200).json({
+        return {
           url: publicUrl,
           storagePath,
           prompt,
           aspectRatio: aspectRatio || '3:2',
           imageSize: imageSize || '1K',
-        });
-        return;
+        };
       } catch (uploadErr) {
         console.error('[generate] Supabase upload error, falling back to base64:', uploadErr);
       }
     }
 
-    res.status(200).json({
-      base64Data,
-      prompt,
-      aspectRatio: aspectRatio || '3:2',
-      imageSize: imageSize || '1K',
-    });
-  } catch (error) {
-    console.error('[generate] Unexpected error:', error);
-    res.status(500).json({
-      error: error instanceof Error ? error.message : 'Failed to generate image',
-    });
+  return {
+    base64Data,
+    prompt,
+    aspectRatio: aspectRatio || '3:2',
+    imageSize: imageSize || '1K',
+  };
+}
+
+export async function generateHandler(req: Request, res: Response): Promise<void> {
+  if (req.method !== 'POST') {
+    res.status(405).json({ error: 'Method not allowed' });
+    return;
   }
+
+  if (!LAOZHANG_API_KEY || LAOZHANG_API_KEY === 'sk-YOUR_API_KEY_HERE') {
+    console.error('[generate] LAOZHANG_API_KEY not set');
+    res.status(500).json({
+      error: 'Server configuration error: LAOZHANG_API_KEY not set. Add it in Heroku Config Vars.',
+    });
+    return;
+  }
+
+  const body = req.body as {
+    prompt?: string;
+    aspectRatio?: string;
+    imageSize?: string;
+    referenceImages?: string[];
+    referenceImageUrls?: string[];
+  };
+
+  const { prompt } = body;
+  if (!prompt || typeof prompt !== 'string') {
+    res.status(400).json({ error: 'Missing or invalid prompt' });
+    return;
+  }
+
+  const jobId = createJob();
+  void (async () => {
+    try {
+      const result = await doGenerate({ ...body, prompt });
+      setJobResult(jobId, result);
+    } catch (error) {
+      console.error('[generate] Job failed:', error);
+      setJobError(jobId, error instanceof Error ? error.message : 'Generation failed');
+    }
+  })();
+
+  res.status(202).json({ jobId });
+}
+
+export async function generateStatusHandler(req: Request, res: Response): Promise<void> {
+  const jobId = req.params.jobId;
+  if (!jobId) {
+    res.status(400).json({ error: 'Missing jobId' });
+    return;
+  }
+
+  const job = getJob(jobId);
+  if (!job) {
+    res.status(404).json({ error: 'Job not found' });
+    return;
+  }
+
+  if (job.status === 'done' && job.result) {
+    res.status(200).json(job.result);
+    return;
+  }
+
+  if (job.status === 'error') {
+    res.status(500).json({ error: job.error || 'Generation failed' });
+    return;
+  }
+
+  res.status(200).json({ status: 'pending' });
 }
