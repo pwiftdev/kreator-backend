@@ -21,14 +21,9 @@ app.use((req, res, next) => {
   next();
 });
 
-const corsOrigins = process.env.CORS_ORIGINS?.split(',').map((o) => o.trim()).filter(Boolean) || [
-  'http://localhost:5173',
-  'http://localhost:3000',
-];
-
 app.use(
   cors({
-    origin: corsOrigins.length > 0 ? corsOrigins : true,
+    origin: true,
     methods: ['GET', 'POST', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
     optionsSuccessStatus: 204,
@@ -51,5 +46,4 @@ app.post('/api/enhance-prompt', enhancePromptHandler);
 
 app.listen(PORT, () => {
   console.log(`[start] kreator-backend listening on port ${PORT}`);
-  console.log(`[start] CORS origins: ${corsOrigins.join(', ')}`);
 });
