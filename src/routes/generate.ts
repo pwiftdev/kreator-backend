@@ -1,7 +1,17 @@
 import type { Request, Response } from 'express';
 import sharp from 'sharp';
+import { createClient } from '@supabase/supabase-js';
 
 const LAOZHANG_API_KEY = process.env.LAOZHANG_API_KEY;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+const supabase =
+  SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
+    ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    : null;
+
+const BUCKET_NAME = 'generated-images';
 const LAOZHANG_API_URL = process.env.LAOZHANG_API_URL || 'https://api.laozhang.ai';
 
 const LAOZHANG_FETCH_TIMEOUT_MS = 180_000; // 3 min per attempt (matches LaoZhang example)
@@ -217,7 +227,46 @@ export async function generateHandler(req: Request, res: Response): Promise<void
     }
 
     const elapsed = Date.now() - startTime;
-    console.log(`[generate] Success (${(base64Data.length / 1024).toFixed(1)}KB image, ${elapsed}ms)`);
+    const sizeKB = (base64Data.length / 1024).toFixed(1);
+    console.log(`[generate] LaoZhang returned ${sizeKB}KB image, ${elapsed}ms`);
+
+    const fileName = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}.png`;
+    const storagePath = fileName;
+
+    if (supabase) {
+      try {
+        const buf = Buffer.from(base64Data, 'base64');
+        const { error: uploadError } = await supabase.storage
+          .from(BUCKET_NAME)
+          .upload(storagePath, buf, { contentType: 'image/png', upsert: false });
+
+        if (uploadError) {
+          console.error('[generate] Supabase upload failed, falling back to base64:', uploadError.message);
+          res.status(200).json({
+            base64Data,
+            prompt,
+            aspectRatio: aspectRatio || '3:2',
+            imageSize: imageSize || '1K',
+          });
+          return;
+        }
+
+        const { data: urlData } = supabase.storage.from(BUCKET_NAME).getPublicUrl(storagePath);
+        const publicUrl = urlData.publicUrl;
+        console.log(`[generate] Uploaded to Supabase, returning URL (${Date.now() - startTime}ms total)`);
+        res.status(200).json({
+          url: publicUrl,
+          storagePath,
+          prompt,
+          aspectRatio: aspectRatio || '3:2',
+          imageSize: imageSize || '1K',
+        });
+        return;
+      } catch (uploadErr) {
+        console.error('[generate] Supabase upload error, falling back to base64:', uploadErr);
+      }
+    }
+
     res.status(200).json({
       base64Data,
       prompt,

@@ -27,6 +27,10 @@ Copy `.env.example` to `.env` and set:
 - `LAOZHANG_API_URL` – default `https://api.laozhang.ai`
 - `CORS_ORIGINS` – comma-separated frontend origins, e.g. `https://your-app.vercel.app,http://localhost:5173`
 - `ENHANCE_PROMPT_MODEL` – optional, default `gpt-4o-mini`
+- `SUPABASE_URL` – your Supabase project URL (for uploading generated images)
+- `SUPABASE_SERVICE_ROLE_KEY` – Supabase service role key (bypasses RLS for server uploads)
+
+Without Supabase vars, the backend falls back to returning base64 in the JSON response (can cause "Failed to fetch" for large images).
 
 ### 3. Run locally
 
