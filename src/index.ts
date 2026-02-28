@@ -31,6 +31,7 @@ app.use(
     origin: corsOrigins.length > 0 ? corsOrigins : true,
     methods: ['GET', 'POST', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
+    optionsSuccessStatus: 204,
   })
 );
 
