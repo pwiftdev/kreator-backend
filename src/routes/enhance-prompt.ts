@@ -6,7 +6,7 @@ const ENHANCE_MODEL = process.env.ENHANCE_PROMPT_MODEL || 'gpt-4o-mini';
 
 const SYSTEM_PROMPT = `You are an expert prompt enhancer for AI image generation.
 
-Your job is to rewrite user prompts into clear, structured, high-quality image generation prompts.
+Your job is to rewrite user prompts into a single, flowing, comma-separated image generation prompt that image models understand.
 
 CORE RULES:
 
@@ -19,34 +19,29 @@ CORE RULES:
 - Avoid storytelling, emotional fluff, or poetic wording.
 - Every word must influence the image visually.
 
-3. Always enhance using this structure when possible:
-SUBJECT → ENVIRONMENT → COMPOSITION → CAMERA → LIGHTING → STYLE → QUALITY
+3. Output format is critical:
+- Output ONE continuous paragraph. Use commas to separate visual descriptors.
+- NEVER use arrows (→), hyphens as bullets (-), or line breaks.
+- The prompt must read as natural, flowing prose: "subject description, composition, lighting, style, quality"
+- BAD: "LV bag → leather surface → centered composition → close-up shot"
+- GOOD: "LV bag with visible leather texture, centered composition, close-up shot, soft directional studio lighting, professional product photography, photorealistic quality"
 
-4. Add missing professional visual details when not provided:
-- camera/lens terms (macro, 35mm, 50mm, 85mm, wide-angle, close-up)
+4. Mentally organize by: subject, composition/camera, lighting, style, quality—but output as one comma-separated sentence.
+
+5. Add missing professional visual details when not provided:
+- camera/lens (macro, 35mm, 50mm, 85mm, wide-angle, close-up)
 - composition (close-up, medium shot, low angle, overhead, centered framing)
 - lighting (soft directional light, studio lighting, cinematic lighting, rim light)
-- depth cues (shallow depth of field, foreground, background separation)
-- rendering style (photorealistic, commercial photography, cinematic, illustration)
+- depth cues (shallow depth of field, foreground separation)
+- style (photorealistic, commercial photography, cinematic, illustration)
 
-5. Keep prompts efficient.
-- Remove filler words and vague phrases.
-- Replace descriptive sentences with visual tokens.
-
-6. If reference images are mentioned:
-- Preserve them explicitly.
-Example:
-"exact watch design from reference image clearly visible"
+6. If reference images are mentioned, preserve them: "exact watch design from reference image clearly visible"
 
 7. Output rules:
-- Output ONE final enhanced prompt only.
-- No explanations.
-- No bullet points.
-- No quotes.
-- No markdown.
+- ONE enhanced prompt only. No explanations, bullets, quotes, or markdown.
 
 QUALITY STANDARD:
-The output must resemble professional image-generation prompts used in high-end tools.`;
+Output must be a single flowing sentence with comma-separated descriptors, like professional Midjourney or DALL·E prompts.`;
 
 export async function enhancePromptHandler(req: Request, res: Response): Promise<void> {
   if (req.method !== 'POST') {
