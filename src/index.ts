@@ -34,6 +34,11 @@ app.use(
   })
 );
 
+// Root - friendly message when visiting in browser
+app.get('/', (_req, res) => {
+  res.json({ service: 'kreator-backend', status: 'ok', health: '/health' });
+});
+
 // Health check
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'kreator-backend' });
