@@ -285,11 +285,12 @@ export async function generateHandler(req: Request, res: Response): Promise<void
     aspectRatio?: string;
     imageSize?: string;
     model?: string;
+    userId?: string;
     referenceImages?: string[];
     referenceImageUrls?: string[];
   };
 
-  const { prompt } = body;
+  const { prompt, userId } = body;
   if (!prompt || typeof prompt !== 'string') {
     res.status(400).json({ error: 'Missing or invalid prompt' });
     return;
@@ -308,6 +309,33 @@ export async function generateHandler(req: Request, res: Response): Promise<void
     try {
       await setJobRunning(jobId);
       const result = await doGenerate({ ...body, prompt });
+      // If backend uploaded to Supabase and we have userId, save metadata here so images persist on reload
+      if (result.url && result.storagePath && supabase && userId && typeof userId === 'string') {
+        try {
+          const refUrls = Array.isArray(body.referenceImageUrls)
+            ? body.referenceImageUrls.filter((u): u is string => typeof u === 'string' && !!u)
+            : [];
+          const insertPayload: Record<string, unknown> = {
+            prompt: result.prompt,
+            aspect_ratio: result.aspectRatio,
+            image_size: result.imageSize,
+            storage_path: result.storagePath,
+            file_name: result.storagePath,
+            user_id: userId,
+          };
+          if (refUrls.length > 0) insertPayload.reference_image_urls = refUrls;
+          const { data: row, error: insertErr } = await supabase
+            .from('images')
+            .insert(insertPayload)
+            .select('id')
+            .single();
+          if (!insertErr && row?.id) {
+            (result as Record<string, unknown>).id = row.id;
+          }
+        } catch (metaErr) {
+          console.warn('[generate] Failed to save metadata (frontend will save):', metaErr);
+        }
+      }
       await setJobResult(jobId, result);
     } catch (error) {
       console.error('[generate] Job failed:', error);

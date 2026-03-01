@@ -5,6 +5,7 @@ import { createClient, SupabaseClient } from '@supabase/supabase-js';
 export type JobStatus = 'pending' | 'running' | 'done' | 'error';
 
 export interface JobResult {
+  id?: string;
   url?: string;
   storagePath?: string;
   base64Data?: string;
