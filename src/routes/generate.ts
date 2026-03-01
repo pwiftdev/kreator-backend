@@ -300,6 +300,24 @@ export async function generateHandler(req: Request, res: Response): Promise<void
     return;
   }
 
+  // Deduct 1 credit before creating job (1 image = 1 credit)
+  const amount = 1;
+  if (userId && typeof userId === 'string' && supabase) {
+    const { data: newCredits, error: deductErr } = await supabase.rpc('deduct_credits', {
+      p_user_id: userId,
+      p_amount: amount,
+    });
+    if (deductErr) {
+      console.error('[generate] deduct_credits error:', deductErr);
+      res.status(500).json({ error: 'Failed to check credits' });
+      return;
+    }
+    if (newCredits == null) {
+      res.status(402).json({ error: 'Insufficient credits' });
+      return;
+    }
+  }
+
   let jobId: string;
   try {
     jobId = await createJob();
