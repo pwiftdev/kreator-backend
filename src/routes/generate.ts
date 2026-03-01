@@ -231,7 +231,11 @@ async function doGenerate(body: GenerateBody): Promise<GenerateResult> {
         const buf = Buffer.from(base64Data, 'base64');
         const { error: uploadError } = await supabase.storage
           .from(BUCKET_NAME)
-          .upload(storagePath, buf, { contentType: 'image/png', upsert: false });
+          .upload(storagePath, buf, {
+            contentType: 'image/png',
+            upsert: false,
+            cacheControl: '31536000', // 1 year - reduce repeated downloads from CDN
+          });
 
         if (uploadError) {
           console.error('[generate] Supabase upload failed, falling back to base64:', uploadError.message);
