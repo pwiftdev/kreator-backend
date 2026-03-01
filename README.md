@@ -27,10 +27,28 @@ Copy `.env.example` to `.env` and set:
 - `LAOZHANG_API_URL` – default `https://api.laozhang.ai`
 - `CORS_ORIGINS` – comma-separated frontend origins, e.g. `https://your-app.vercel.app,http://localhost:5173`
 - `ENHANCE_PROMPT_MODEL` – optional, default `gpt-4o-mini`
-- `SUPABASE_URL` – your Supabase project URL (for uploading generated images)
+- `SUPABASE_URL` – your Supabase project URL (for uploading generated images and persisting jobs)
 - `SUPABASE_SERVICE_ROLE_KEY` – Supabase service role key (bypasses RLS for server uploads)
 
-Without Supabase vars, the backend falls back to returning base64 in the JSON response (can cause "Failed to fetch" for large images).
+Without Supabase vars, the backend falls back to returning base64 in the JSON response (can cause "Failed to fetch" for large images). **Jobs require Supabase**—without it, generation will fail.
+
+### Supabase: generation_jobs table
+
+Run the migration in Supabase SQL Editor (see `../imagegenprivate/supabase-jobs.sql`):
+
+```sql
+CREATE TABLE IF NOT EXISTS public.generation_jobs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'done', 'error')),
+  result jsonb,
+  error_message text,
+  created_at timestamptz DEFAULT now(),
+  updated_at timestamptz DEFAULT now()
+);
+ALTER TABLE public.generation_jobs ENABLE ROW LEVEL SECURITY;
+```
+
+Jobs persist across dyno restarts and deploys.
 
 ### 3. Run locally
 
@@ -66,7 +84,8 @@ Leave empty to use same-origin (Vercel API routes).
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Health check |
-| POST | `/api/generate` | Generate image via LaoZhang |
+| POST | `/api/generate` | Start generation (returns 202 + jobId) |
+| GET | `/api/generate/status/:jobId` | Poll for job result |
 | POST | `/api/enhance-prompt` | Enhance prompt via LaoZhang |
 
 ### POST /api/generate

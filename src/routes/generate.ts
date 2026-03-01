@@ -1,7 +1,7 @@
 import type { Request, Response } from 'express';
 import sharp from 'sharp';
 import { createClient } from '@supabase/supabase-js';
-import { createJob, getJob, setJobError, setJobResult } from '../jobs.js';
+import { createJob, getJob, setJobError, setJobResult, setJobRunning } from '../jobs.js';
 
 const LAOZHANG_API_KEY = process.env.LAOZHANG_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -295,14 +295,23 @@ export async function generateHandler(req: Request, res: Response): Promise<void
     return;
   }
 
-  const jobId = createJob();
+  let jobId: string;
+  try {
+    jobId = await createJob();
+  } catch (err) {
+    console.error('[generate] Failed to create job:', err);
+    res.status(500).json({ error: 'Failed to create job' });
+    return;
+  }
+
   void (async () => {
     try {
+      await setJobRunning(jobId);
       const result = await doGenerate({ ...body, prompt });
-      setJobResult(jobId, result);
+      await setJobResult(jobId, result);
     } catch (error) {
       console.error('[generate] Job failed:', error);
-      setJobError(jobId, error instanceof Error ? error.message : 'Generation failed');
+      await setJobError(jobId, error instanceof Error ? error.message : 'Generation failed');
     }
   })();
 
@@ -316,7 +325,7 @@ export async function generateStatusHandler(req: Request, res: Response): Promis
     return;
   }
 
-  const job = getJob(jobId);
+  const job = await getJob(jobId);
   if (!job) {
     res.status(404).json({ error: 'Job not found' });
     return;
@@ -332,5 +341,5 @@ export async function generateStatusHandler(req: Request, res: Response): Promis
     return;
   }
 
-  res.status(200).json({ status: 'pending' });
+  res.status(200).json({ status: job.status === 'running' ? 'running' : 'pending' });
 }
