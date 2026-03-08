@@ -14,6 +14,7 @@ const supabase =
 
 const BUCKET_NAME = 'generated-images';
 const THUMB_PATH_PREFIX = 'thumbs/';
+const REFS_PATH_PREFIX = 'refs/';
 const THUMB_WIDTH = 400;
 const THUMB_JPEG_QUALITY = 65;
 const LAOZHANG_API_URL = process.env.LAOZHANG_API_URL || 'https://api.laozhang.ai';
@@ -40,6 +41,30 @@ async function compressRefImage(base64: string, mime: string): Promise<string> {
     .jpeg({ quality: REF_IMAGE_JPEG_QUALITY })
     .toBuffer();
   return out.toString('base64');
+}
+
+/** Upload base64 reference image to Supabase and return public URL */
+async function uploadRefToSupabase(base64Data: string): Promise<string | null> {
+  if (!supabase) return null;
+  const base64Clean = base64Data.includes('base64,') ? base64Data.split('base64,')[1] : base64Data;
+  if (!base64Clean) return null;
+  try {
+    const buf = Buffer.from(base64Clean, 'base64');
+    const fileName = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}.jpg`;
+    const storagePath = REFS_PATH_PREFIX + fileName;
+    const { error } = await supabase.storage
+      .from(BUCKET_NAME)
+      .upload(storagePath, buf, { contentType: 'image/jpeg', upsert: false, cacheControl: '31536000' });
+    if (error) {
+      console.warn('[generate] Failed to upload main ref:', error.message);
+      return null;
+    }
+    const { data } = supabase.storage.from(BUCKET_NAME).getPublicUrl(storagePath);
+    return data.publicUrl;
+  } catch (err) {
+    console.warn('[generate] Upload ref error:', err);
+    return null;
+  }
 }
 
 /** Fetch image from URL and return base64 (no data URL prefix) */
@@ -134,7 +159,10 @@ async function doGenerate(body: GenerateBody): Promise<GenerateResult> {
       { text: prompt },
     ];
 
-    let imageParts = await resolveReferenceImages(referenceImages, referenceImageUrls);
+    // When referenceImages present (moodboard flow with main ref), use only base64 to avoid duplicates
+    let imageParts = referenceImages?.length
+      ? await resolveReferenceImages(referenceImages, [])
+      : await resolveReferenceImages([], referenceImageUrls);
     if (imageParts.length > 0) {
       console.log(`[generate] Resolved ${imageParts.length} reference image(s), compressing...`);
       const compressed: Array<{ mime_type: string; data: string }> = [];
@@ -373,9 +401,16 @@ export async function generateHandler(req: Request, res: Response): Promise<void
       // If backend uploaded to Supabase and we have userId, save metadata here so images persist on reload
       if (result.url && result.storagePath && supabase && userId && typeof userId === 'string') {
         try {
-          const refUrls = Array.isArray(body.referenceImageUrls)
+          let refUrls: string[] = Array.isArray(body.referenceImageUrls)
             ? body.referenceImageUrls.filter((u): u is string => typeof u === 'string' && !!u)
             : [];
+          // When moodboard flow: referenceImages has main ref (base64) at index 0, referenceImageUrls has moodboard URLs.
+          // Upload main ref to get URL, prepend so order is [main, moodboard1, moodboard2...]
+          const referenceImages = Array.isArray(body.referenceImages) ? body.referenceImages : [];
+          if (referenceImages.length > 0 && referenceImages[0]) {
+            const mainRefUrl = await uploadRefToSupabase(referenceImages[0]);
+            if (mainRefUrl) refUrls = [mainRefUrl, ...refUrls];
+          }
           const insertPayload: Record<string, unknown> = {
             prompt: result.prompt,
             aspect_ratio: result.aspectRatio,
