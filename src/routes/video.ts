@@ -195,9 +195,16 @@ export async function videoContentHandler(req: Request, res: Response): Promise<
           return;
         }
       } else {
-        console.error('[video] Content: API returned binary (video file) but we need JSON with url. Use Accept: application/json.');
-        res.status(502).json({
-          error: 'Video content endpoint returned the video file instead of JSON. Backend expects JSON with a url field.',
+        // API returned the video file directly (common). Return our proxy URL so frontend can play it.
+        const baseUrl = `${req.protocol}://${req.get('host')}`;
+        const proxyUrl = `${baseUrl}/api/videos/${videoId}/file`;
+        res.status(200).json({
+          videoId,
+          url: proxyUrl,
+          duration: undefined,
+          resolution: undefined,
+          prompt: undefined,
+          model: undefined,
         });
         return;
       }
@@ -223,5 +230,49 @@ export async function videoContentHandler(req: Request, res: Response): Promise<
   } catch (err) {
     console.error('[video] Content error:', err);
     res.status(500).json({ error: err instanceof Error ? err.message : 'Get content failed' });
+  }
+}
+
+/** Stream video file when LaoZhang returns binary from /content */
+export async function videoFileHandler(req: Request, res: Response): Promise<void> {
+  if (req.method !== 'GET') {
+    res.status(405).json({ error: 'Method not allowed' });
+    return;
+  }
+  const videoId = req.params.videoId;
+  if (!videoId) {
+    res.status(400).json({ error: 'Missing videoId' });
+    return;
+  }
+  if (!LAOZHANG_API_KEY) {
+    res.status(500).json({ error: 'LAOZHANG_API_KEY not set' });
+    return;
+  }
+
+  try {
+    const response = await fetch(`${LAOZHANG_API_URL}/v1/videos/${videoId}/content`, {
+      headers: { Authorization: `Bearer ${LAOZHANG_API_KEY}` },
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      let msg = `LaoZhang API error: ${response.status}`;
+      try {
+        const err = JSON.parse(text);
+        if (err?.error?.message) msg = err.error.message;
+      } catch {
+        if (text) msg = text.slice(0, 200);
+      }
+      res.status(response.status >= 500 ? 502 : response.status).json({ error: msg });
+      return;
+    }
+
+    const contentType = response.headers.get('content-type') || 'video/mp4';
+    res.setHeader('Content-Type', contentType);
+    const buffer = await response.arrayBuffer();
+    res.send(Buffer.from(buffer));
+  } catch (err) {
+    console.error('[video] File stream error:', err);
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Video stream failed' });
   }
 }

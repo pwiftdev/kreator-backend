@@ -4,10 +4,13 @@ import cors from 'cors';
 
 import { generateHandler, generateStatusHandler } from './routes/generate.js';
 import { enhancePromptHandler } from './routes/enhance-prompt.js';
-import { createVideoHandler, videoStatusHandler, videoContentHandler } from './routes/video.js';
+import { createVideoHandler, videoStatusHandler, videoContentHandler, videoFileHandler } from './routes/video.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Trust reverse proxy (Heroku, etc.) so req.protocol is correct for proxy URLs
+app.set('trust proxy', 1);
 
 // 50MB limit - handles large base64 reference images (Vercel's 4.5MB was the bottleneck)
 app.use(express.json({ limit: '50mb' }));
@@ -50,6 +53,7 @@ app.post('/api/enhance-prompt', enhancePromptHandler);
 app.post('/api/videos', createVideoHandler);
 app.get('/api/videos/:videoId/status', videoStatusHandler);
 app.get('/api/videos/:videoId/content', videoContentHandler);
+app.get('/api/videos/:videoId/file', videoFileHandler);
 
 app.listen(PORT, () => {
   console.log(`[start] kreator-backend listening on port ${PORT}`);
