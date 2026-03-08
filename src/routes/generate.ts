@@ -13,6 +13,9 @@ const supabase =
     : null;
 
 const BUCKET_NAME = 'generated-images';
+const THUMB_PATH_PREFIX = 'thumbs/';
+const THUMB_WIDTH = 400;
+const THUMB_JPEG_QUALITY = 65;
 const LAOZHANG_API_URL = process.env.LAOZHANG_API_URL || 'https://api.laozhang.ai';
 
 const LAOZHANG_FETCH_TIMEOUT_MS = 180_000; // 3 min per attempt (matches LaoZhang example)
@@ -20,6 +23,14 @@ const LAOZHANG_MAX_RETRIES = 3;
 const LAOZHANG_RETRY_DELAY_MS = 5000;
 const REF_IMAGE_MAX_DIM = 768;
 const REF_IMAGE_JPEG_QUALITY = 75;
+
+/** Create a thumbnail buffer from full-size image buffer (for grid cards). */
+async function createThumbnail(buf: Buffer): Promise<Buffer> {
+  return sharp(buf)
+    .resize(THUMB_WIDTH, THUMB_WIDTH, { fit: 'inside', withoutEnlargement: true })
+    .jpeg({ quality: THUMB_JPEG_QUALITY })
+    .toBuffer();
+}
 
 /** Compress reference image for LaoZhang API to reduce payload size and avoid connection drops */
 async function compressRefImage(base64: string, mime: string): Promise<string> {
@@ -101,6 +112,8 @@ type GenerateBody = {
 type GenerateResult = {
   url?: string;
   storagePath?: string;
+  thumbUrl?: string;
+  thumbStoragePath?: string;
   base64Data?: string;
   prompt: string;
   aspectRatio: string;
@@ -249,10 +262,36 @@ async function doGenerate(body: GenerateBody): Promise<GenerateResult> {
 
         const { data: urlData } = supabase.storage.from(BUCKET_NAME).getPublicUrl(storagePath);
         const publicUrl = urlData.publicUrl;
+
+        let thumbUrl: string | undefined;
+        let thumbStoragePath: string | undefined;
+        try {
+          const thumbBuf = await createThumbnail(buf);
+          const baseName = fileName.replace(/\.\w+$/, '');
+          const thumbPath = `${THUMB_PATH_PREFIX}${baseName}-thumb.jpg`;
+          const { error: thumbUploadError } = await supabase.storage
+            .from(BUCKET_NAME)
+            .upload(thumbPath, thumbBuf, {
+              contentType: 'image/jpeg',
+              upsert: false,
+              cacheControl: '31536000',
+            });
+          if (!thumbUploadError) {
+            thumbStoragePath = thumbPath;
+            const { data: thumbUrlData } = supabase.storage.from(BUCKET_NAME).getPublicUrl(thumbPath);
+            thumbUrl = thumbUrlData.publicUrl;
+            console.log(`[generate] Thumbnail uploaded: ${thumbPath}`);
+          }
+        } catch (thumbErr) {
+          console.warn('[generate] Thumbnail creation failed, using full URL for grid:', thumbErr);
+        }
+
         console.log(`[generate] Uploaded to Supabase, returning URL (${Date.now() - startTime}ms total)`);
         return {
           url: publicUrl,
           storagePath,
+          thumbUrl: thumbUrl ?? publicUrl,
+          thumbStoragePath,
           prompt,
           aspectRatio: aspectRatio || '3:2',
           imageSize: imageSize || '1K',
@@ -345,6 +384,7 @@ export async function generateHandler(req: Request, res: Response): Promise<void
             file_name: result.storagePath,
             user_id: userId,
           };
+          if (result.thumbStoragePath) insertPayload.thumb_storage_path = result.thumbStoragePath;
           if (refUrls.length > 0) insertPayload.reference_image_urls = refUrls;
           const { data: row, error: insertErr } = await supabase
             .from('images')
