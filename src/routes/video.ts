@@ -78,7 +78,7 @@ export async function createVideoHandler(req: Request, res: Response): Promise<v
       form.append('model', model);
       form.append('prompt', prompt);
       const ext = contentType.includes('png') ? 'png' : 'jpg';
-      form.append('input_reference', new Blob([buffer], { type: contentType }), `ref.${ext}`);
+      form.append('input_reference', new Blob([new Uint8Array(buffer)], { type: contentType }), `ref.${ext}`);
       apiRes = await fetch(url, {
         method: 'POST',
         headers,
@@ -95,8 +95,8 @@ export async function createVideoHandler(req: Request, res: Response): Promise<v
 
     const data = (await apiRes.json()) as { id?: string; object?: string; status?: string; error?: { message?: string } };
     if (!apiRes.ok) {
-      const msg = data?.error?.message || `LaoZhang API error: ${response.status}`;
-      console.error('[video] Create failed:', response.status, msg);
+      const msg = data?.error?.message || `LaoZhang API error: ${apiRes.status}`;
+      console.error('[video] Create failed:', apiRes.status, msg);
       res.status(apiRes.status >= 500 ? 502 : apiRes.status).json({ error: msg });
       return;
     }
