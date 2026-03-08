@@ -164,9 +164,14 @@ export async function videoContentHandler(req: Request, res: Response): Promise<
 
   try {
     const response = await fetch(`${LAOZHANG_API_URL}/v1/videos/${videoId}/content`, {
-      headers: { Authorization: `Bearer ${LAOZHANG_API_KEY}` },
+      headers: {
+        Authorization: `Bearer ${LAOZHANG_API_KEY}`,
+        Accept: 'application/json',
+      },
     });
-    const data = (await response.json()) as {
+
+    const contentType = response.headers.get('content-type') || '';
+    let data: {
       id?: string;
       status?: string;
       url?: string;
@@ -176,6 +181,28 @@ export async function videoContentHandler(req: Request, res: Response): Promise<
       model?: string;
       error?: { message?: string };
     };
+
+    if (contentType.includes('application/json')) {
+      data = (await response.json()) as typeof data;
+    } else {
+      const text = await response.text();
+      if (text.startsWith('{')) {
+        try {
+          data = JSON.parse(text) as typeof data;
+        } catch {
+          console.error('[video] Content: response is not JSON and not binary video', contentType?.slice(0, 50));
+          res.status(502).json({ error: 'API returned unexpected format' });
+          return;
+        }
+      } else {
+        console.error('[video] Content: API returned binary (video file) but we need JSON with url. Use Accept: application/json.');
+        res.status(502).json({
+          error: 'Video content endpoint returned the video file instead of JSON. Backend expects JSON with a url field.',
+        });
+        return;
+      }
+    }
+
     if (!response.ok) {
       const msg = data?.error?.message || `LaoZhang API error: ${response.status}`;
       res.status(response.status >= 500 ? 502 : response.status).json({ error: msg });
