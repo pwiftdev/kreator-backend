@@ -1,4 +1,5 @@
 import type { Request, Response } from 'express';
+import FormData from 'form-data';
 
 const LAOZHANG_API_KEY = process.env.LAOZHANG_API_KEY;
 const LAOZHANG_API_URL = process.env.LAOZHANG_API_URL || 'https://api.laozhang.ai';
@@ -72,19 +73,24 @@ export async function videoGenerateHandler(req: Request, res: Response): Promise
     const ext = mime.includes('png') ? 'png' : mime.includes('webp') ? 'webp' : 'jpg';
     const { size, seconds } = toAsyncParams(model);
 
+    // Use form-data package so multipart format matches LaoZhang Async API expectations
     const form = new FormData();
     form.append('model', 'sora-2');
     form.append('prompt', prompt);
     form.append('size', size);
     form.append('seconds', seconds);
-    form.append('input_reference', new Blob([new Uint8Array(buffer)], { type: mime }), `image.${ext}`);
+    form.append('input_reference', buffer, {
+      filename: `image.${ext}`,
+      contentType: mime,
+    });
 
     const response = await fetch(`${LAOZHANG_API_URL}/v1/videos`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${LAOZHANG_API_KEY}`,
+        ...form.getHeaders(),
       },
-      body: form,
+      body: new Uint8Array(form.getBuffer()),
     });
 
     if (!response.ok) {
