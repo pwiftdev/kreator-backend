@@ -4,6 +4,7 @@ import cors from 'cors';
 
 import { generateHandler, generateStatusHandler } from './routes/generate.js';
 import { enhancePromptHandler } from './routes/enhance-prompt.js';
+import { videoGenerateHandler } from './routes/video.js';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -46,6 +47,7 @@ app.get('/health', (_req, res) => {
 app.post('/api/generate', generateHandler);
 app.get('/api/generate/status/:jobId', generateStatusHandler);
 app.post('/api/enhance-prompt', enhancePromptHandler);
+app.post('/api/video/generate', videoGenerateHandler);
 
 app.listen(PORT, () => {
   console.log(`[start] kreator-backend listening on port ${PORT}`);
