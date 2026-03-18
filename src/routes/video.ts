@@ -133,7 +133,8 @@ export async function videoStatusHandler(req: Request, res: Response): Promise<v
 
 /**
  * GET /api/video/result/:taskId
- * Fetch /content from LaoZhang (returns JSON with url field) and proxy it.
+ * Fetch /content from LaoZhang. The endpoint may return JSON (with a `url` field)
+ * or raw MP4 binary — we handle both.
  */
 export async function videoResultHandler(req: Request, res: Response): Promise<void> {
   const taskId = req.params.taskId;
@@ -151,8 +152,29 @@ export async function videoResultHandler(req: Request, res: Response): Promise<v
       return;
     }
 
-    const data = (await response.json()) as { url?: string; duration?: number; resolution?: string };
-    res.status(200).json(data);
+    const ct = (response.headers.get('content-type') || '').toLowerCase();
+
+    if (ct.includes('application/json')) {
+      const data = (await response.json()) as { url?: string; duration?: number; resolution?: string };
+      res.status(200).json(data);
+      return;
+    }
+
+    // Raw binary (MP4) — stream it through to client
+    res.setHeader('Content-Type', ct || 'video/mp4');
+    const cl = response.headers.get('content-length');
+    if (cl) res.setHeader('Content-Length', cl);
+    res.setHeader('Content-Disposition', 'inline; filename="kreator-video.mp4"');
+
+    const reader = response.body?.getReader();
+    if (!reader) { res.status(500).json({ error: 'No response body' }); return; }
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      res.write(Buffer.from(value));
+    }
+    res.end();
   } catch (err) {
     console.error('[video] Result error:', err);
     if (!res.headersSent) {
