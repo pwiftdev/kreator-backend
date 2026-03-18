@@ -57,6 +57,10 @@ export async function videoGenerateHandler(req: Request, res: Response): Promise
       return;
     }
 
+    const requestOrigin = req.get('Origin');
+    if (requestOrigin) {
+      res.setHeader('Access-Control-Allow-Origin', requestOrigin);
+    }
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
