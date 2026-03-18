@@ -4,50 +4,36 @@ import FormData from 'form-data';
 const LAOZHANG_API_KEY = process.env.LAOZHANG_API_KEY;
 const LAOZHANG_API_URL = process.env.LAOZHANG_API_URL || 'https://api.laozhang.ai';
 
-/** Map frontend model id to LaoZhang Async API params */
-function toAsyncParams(model: string): { size: string; seconds: string } {
-  switch (model) {
-    case 'sora_video2-landscape':
-      return { size: '1280x720', seconds: '10' };
-    case 'sora_video2-15s':
-      return { size: '720x1280', seconds: '15' };
-    case 'sora_video2-landscape-15s':
-      return { size: '1280x720', seconds: '15' };
-    default:
-      return { size: '720x1280', seconds: '10' };
-  }
-}
+/** Allowed Veo 3.1 image-to-video models (all have -fl suffix). */
+const ALLOWED_MODELS = new Set([
+  'veo-3.1-fl',
+  'veo-3.1-fast-fl',
+  'veo-3.1-landscape-fl',
+  'veo-3.1-landscape-fast-fl',
+]);
 
-/** Get image buffer from URL or data URL */
+/** Resolve image URL or data URL to a Buffer + mime type. */
 async function getImageBuffer(imageUrl: string): Promise<{ buffer: Buffer; mime: string }> {
   if (imageUrl.startsWith('data:')) {
     const match = imageUrl.match(/^data:([^;]+);base64,(.+)$/);
     if (!match) throw new Error('Invalid data URL');
-    const mime = match[1].trim();
-    const base64 = match[2];
-    const buffer = Buffer.from(base64, 'base64');
-    return { buffer, mime };
+    return { buffer: Buffer.from(match[2], 'base64'), mime: match[1].trim() };
   }
   const res = await fetch(imageUrl, {
     headers: { 'User-Agent': 'Kreator-Backend/1.0', Accept: 'image/*' },
   });
   if (!res.ok) throw new Error(`Failed to fetch image: ${res.status}`);
   const buf = Buffer.from(await res.arrayBuffer());
-  const contentType = res.headers.get('content-type') || 'image/png';
-  return { buffer: buf, mime: contentType.split(';')[0].trim() };
+  const ct = res.headers.get('content-type') || 'image/png';
+  return { buffer: buf, mime: ct.split(';')[0].trim() };
 }
 
 /**
  * POST /api/video/generate
- * Create async video task (returns immediately, no 30s timeout).
+ * Create Veo 3.1 async video task (returns immediately).
  * Body: { prompt, imageUrl, model? }
  */
 export async function videoGenerateHandler(req: Request, res: Response): Promise<void> {
-  if (req.method !== 'POST') {
-    res.status(405).json({ error: 'Method not allowed' });
-    return;
-  }
-
   if (!LAOZHANG_API_KEY || LAOZHANG_API_KEY === 'sk-YOUR_API_KEY_HERE') {
     res.status(500).json({ error: 'Server configuration error: LAOZHANG_API_KEY not set.' });
     return;
@@ -56,7 +42,9 @@ export async function videoGenerateHandler(req: Request, res: Response): Promise
   const body = req.body as { prompt?: string; imageUrl?: string; model?: string };
   const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
   const imageUrl = typeof body.imageUrl === 'string' ? body.imageUrl.trim() : '';
-  const model = typeof body.model === 'string' && body.model ? body.model : 'sora_video2';
+  const model = typeof body.model === 'string' && ALLOWED_MODELS.has(body.model)
+    ? body.model
+    : 'veo-3.1-fl';
 
   if (!prompt) {
     res.status(400).json({ error: 'Missing or invalid prompt' });
@@ -71,18 +59,13 @@ export async function videoGenerateHandler(req: Request, res: Response): Promise
   try {
     const { buffer, mime } = await getImageBuffer(imageUrl);
     const ext = mime.includes('png') ? 'png' : mime.includes('webp') ? 'webp' : 'jpg';
-    const { size, seconds } = toAsyncParams(model);
 
-    // Use form-data package so multipart format matches LaoZhang Async API expectations
     const form = new FormData();
-    form.append('model', 'sora-2');
+    form.append('model', model);
     form.append('prompt', prompt);
-    form.append('size', size);
-    form.append('seconds', seconds);
-    form.append('input_reference', buffer, {
-      filename: `image.${ext}`,
-      contentType: mime,
-    });
+    form.append('input_reference', buffer, { filename: `image.${ext}`, contentType: mime });
+
+    console.log('[video] Creating Veo task, model=%s, imageSize=%d bytes', model, buffer.length);
 
     const response = await fetch(`${LAOZHANG_API_URL}/v1/videos`, {
       method: 'POST',
@@ -100,14 +83,16 @@ export async function videoGenerateHandler(req: Request, res: Response): Promise
       return;
     }
 
-    const data = (await response.json()) as { id?: string };
+    const data = (await response.json()) as { id?: string; status?: string };
+    console.log('[video] Task created:', JSON.stringify(data));
+
     const taskId = data?.id;
     if (!taskId) {
       res.status(500).json({ error: 'No task ID in response' });
       return;
     }
 
-    res.status(200).json({ taskId });
+    res.status(200).json({ taskId, status: data.status ?? 'queued' });
   } catch (err) {
     console.error('[video] Create error:', err);
     if (!res.headersSent) {
@@ -118,19 +103,12 @@ export async function videoGenerateHandler(req: Request, res: Response): Promise
 
 /**
  * GET /api/video/status/:taskId
- * Proxy task status from LaoZhang (for client polling).
+ * Proxy task status from LaoZhang.
  */
 export async function videoStatusHandler(req: Request, res: Response): Promise<void> {
   const taskId = req.params.taskId;
-  if (!taskId) {
-    res.status(400).json({ error: 'Missing taskId' });
-    return;
-  }
-
-  if (!LAOZHANG_API_KEY || LAOZHANG_API_KEY === 'sk-YOUR_API_KEY_HERE') {
-    res.status(500).json({ error: 'Server configuration error: LAOZHANG_API_KEY not set.' });
-    return;
-  }
+  if (!taskId) { res.status(400).json({ error: 'Missing taskId' }); return; }
+  if (!LAOZHANG_API_KEY) { res.status(500).json({ error: 'API key not configured' }); return; }
 
   try {
     const response = await fetch(`${LAOZHANG_API_URL}/v1/videos/${taskId}`, {
@@ -155,19 +133,12 @@ export async function videoStatusHandler(req: Request, res: Response): Promise<v
 
 /**
  * GET /api/video/result/:taskId
- * Stream completed video from LaoZhang to client (so client doesn't need API key).
+ * Fetch /content from LaoZhang (returns JSON with url field) and proxy it.
  */
 export async function videoResultHandler(req: Request, res: Response): Promise<void> {
   const taskId = req.params.taskId;
-  if (!taskId) {
-    res.status(400).json({ error: 'Missing taskId' });
-    return;
-  }
-
-  if (!LAOZHANG_API_KEY || LAOZHANG_API_KEY === 'sk-YOUR_API_KEY_HERE') {
-    res.status(500).json({ error: 'Server configuration error: LAOZHANG_API_KEY not set.' });
-    return;
-  }
+  if (!taskId) { res.status(400).json({ error: 'Missing taskId' }); return; }
+  if (!LAOZHANG_API_KEY) { res.status(500).json({ error: 'API key not configured' }); return; }
 
   try {
     const response = await fetch(`${LAOZHANG_API_URL}/v1/videos/${taskId}/content`, {
@@ -180,25 +151,12 @@ export async function videoResultHandler(req: Request, res: Response): Promise<v
       return;
     }
 
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Disposition', 'inline; filename="kreator-video.mp4"');
-
-    const reader = response.body?.getReader();
-    if (!reader) {
-      res.status(500).json({ error: 'No response body' });
-      return;
-    }
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      res.write(Buffer.from(value));
-    }
-    res.end();
+    const data = (await response.json()) as { url?: string; duration?: number; resolution?: string };
+    res.status(200).json(data);
   } catch (err) {
-    console.error('[video] Result stream error:', err);
+    console.error('[video] Result error:', err);
     if (!res.headersSent) {
-      res.status(500).json({ error: err instanceof Error ? err.message : 'Video download failed' });
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Video content failed' });
     }
   }
 }
