@@ -143,6 +143,7 @@ type GenerateResult = {
   prompt: string;
   aspectRatio: string;
   imageSize: string;
+  referenceImageUrls?: string[];
 };
 
 async function doGenerate(body: GenerateBody): Promise<GenerateResult> {
@@ -401,16 +402,18 @@ export async function generateHandler(req: Request, res: Response): Promise<void
       // If backend uploaded to Supabase and we have userId, save metadata here so images persist on reload
       if (result.url && result.storagePath && supabase && userId && typeof userId === 'string') {
         try {
-          let refUrls: string[] = Array.isArray(body.referenceImageUrls)
+          const existingUrls: string[] = Array.isArray(body.referenceImageUrls)
             ? body.referenceImageUrls.filter((u): u is string => typeof u === 'string' && !!u)
             : [];
-          // When moodboard flow: referenceImages has main ref (base64) at index 0, referenceImageUrls has moodboard URLs.
-          // Upload main ref to get URL, prepend so order is [main, moodboard1, moodboard2...]
+          // Upload ALL base64 references to Supabase so they persist for modal display and re-run
           const referenceImages = Array.isArray(body.referenceImages) ? body.referenceImages : [];
-          if (referenceImages.length > 0 && referenceImages[0]) {
-            const mainRefUrl = await uploadRefToSupabase(referenceImages[0]);
-            if (mainRefUrl) refUrls = [mainRefUrl, ...refUrls];
+          const uploadedUrls: string[] = [];
+          for (const base64Ref of referenceImages) {
+            if (!base64Ref) continue;
+            const url = await uploadRefToSupabase(base64Ref);
+            if (url) uploadedUrls.push(url);
           }
+          const refUrls = [...uploadedUrls, ...existingUrls];
           const insertPayload: Record<string, unknown> = {
             prompt: result.prompt,
             aspect_ratio: result.aspectRatio,
@@ -420,7 +423,10 @@ export async function generateHandler(req: Request, res: Response): Promise<void
             user_id: userId,
           };
           if (result.thumbStoragePath) insertPayload.thumb_storage_path = result.thumbStoragePath;
-          if (refUrls.length > 0) insertPayload.reference_image_urls = refUrls;
+          if (refUrls.length > 0) {
+            insertPayload.reference_image_urls = refUrls;
+            result.referenceImageUrls = refUrls;
+          }
           const { data: row, error: insertErr } = await supabase
             .from('images')
             .insert(insertPayload)
