@@ -1,8 +1,23 @@
 import type { Request, Response } from 'express';
 import FormData from 'form-data';
+import { createClient } from '@supabase/supabase-js';
 
 const LAOZHANG_API_KEY = process.env.LAOZHANG_API_KEY;
 const LAOZHANG_API_URL = process.env.LAOZHANG_API_URL || 'https://api.laozhang.ai';
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+const supabase =
+  SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
+    ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    : null;
+
+const VIDEO_CREDIT_COST: Record<string, number> = {
+  'veo-3.1-fl': 25,
+  'veo-3.1-fast-fl': 20,
+  'veo-3.1-landscape-fl': 25,
+  'veo-3.1-landscape-fast-fl': 20,
+};
 
 /** Allowed Veo 3.1 image-to-video models (all have -fl suffix). */
 const ALLOWED_MODELS = new Set([
@@ -39,9 +54,10 @@ export async function videoGenerateHandler(req: Request, res: Response): Promise
     return;
   }
 
-  const body = req.body as { prompt?: string; imageUrl?: string; model?: string };
+  const body = req.body as { prompt?: string; imageUrl?: string; model?: string; userId?: string };
   const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
   const imageUrl = typeof body.imageUrl === 'string' ? body.imageUrl.trim() : '';
+  const userId = typeof body.userId === 'string' ? body.userId.trim() : '';
   const model = typeof body.model === 'string' && ALLOWED_MODELS.has(body.model)
     ? body.model
     : 'veo-3.1-fl';
@@ -54,6 +70,25 @@ export async function videoGenerateHandler(req: Request, res: Response): Promise
   if (!imageUrl || (!imageUrl.startsWith('http') && !imageUrl.startsWith('data:'))) {
     res.status(400).json({ error: 'Missing or invalid imageUrl (must be https or data: URL)' });
     return;
+  }
+
+  const creditCost = VIDEO_CREDIT_COST[model] ?? 25;
+
+  if (userId && supabase) {
+    const { data: newCredits, error: deductErr } = await supabase.rpc('deduct_credits', {
+      p_user_id: userId,
+      p_amount: creditCost,
+    });
+    if (deductErr) {
+      console.error('[video] deduct_credits error:', deductErr);
+      res.status(500).json({ error: 'Failed to check credits' });
+      return;
+    }
+    if (newCredits == null) {
+      res.status(402).json({ error: `Insufficient credits. This model costs ${creditCost} credits.` });
+      return;
+    }
+    console.log(`[video] Deducted ${creditCost} credits from user ${userId}, new balance: ${newCredits}`);
   }
 
   try {
