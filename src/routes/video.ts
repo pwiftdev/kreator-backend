@@ -1,6 +1,7 @@
 import type { Request, Response } from 'express';
 import FormData from 'form-data';
 import { createClient } from '@supabase/supabase-js';
+import { sanitizeError } from '../utils/sanitize-error.js';
 
 const LAOZHANG_API_KEY = process.env.LAOZHANG_API_KEY;
 const LAOZHANG_API_URL = process.env.LAOZHANG_API_URL || 'https://api.laozhang.ai';
@@ -113,8 +114,8 @@ export async function videoGenerateHandler(req: Request, res: Response): Promise
 
     if (!response.ok) {
       const errText = await response.text();
-      console.error('[video] LaoZhang create error:', response.status, errText);
-      res.status(response.status).json({ error: errText || `Upstream error: ${response.status}` });
+      console.error('[video] Upstream create error:', response.status, errText);
+      res.status(response.status).json({ error: sanitizeError(errText, response.status, 'video') });
       return;
     }
 
@@ -131,7 +132,7 @@ export async function videoGenerateHandler(req: Request, res: Response): Promise
   } catch (err) {
     console.error('[video] Create error:', err);
     if (!res.headersSent) {
-      res.status(500).json({ error: err instanceof Error ? err.message : 'Video task creation failed' });
+      res.status(500).json({ error: sanitizeError(err instanceof Error ? err.message : null, 500, 'video') });
     }
   }
 }
@@ -152,7 +153,8 @@ export async function videoStatusHandler(req: Request, res: Response): Promise<v
 
     if (!response.ok) {
       const errText = await response.text();
-      res.status(response.status).json({ error: errText || `Upstream error: ${response.status}` });
+      console.error('[video] Upstream status error:', response.status, errText);
+      res.status(response.status).json({ error: sanitizeError(errText, response.status, 'video-status') });
       return;
     }
 
@@ -161,7 +163,7 @@ export async function videoStatusHandler(req: Request, res: Response): Promise<v
   } catch (err) {
     console.error('[video] Status error:', err);
     if (!res.headersSent) {
-      res.status(500).json({ error: err instanceof Error ? err.message : 'Status check failed' });
+      res.status(500).json({ error: sanitizeError(err instanceof Error ? err.message : null, 500, 'video-status') });
     }
   }
 }
@@ -183,7 +185,8 @@ export async function videoResultHandler(req: Request, res: Response): Promise<v
 
     if (!response.ok) {
       const errText = await response.text();
-      res.status(response.status).json({ error: errText || `Upstream error: ${response.status}` });
+      console.error('[video] Upstream result error:', response.status, errText);
+      res.status(response.status).json({ error: sanitizeError(errText, response.status, 'video-result') });
       return;
     }
 
@@ -213,7 +216,7 @@ export async function videoResultHandler(req: Request, res: Response): Promise<v
   } catch (err) {
     console.error('[video] Result error:', err);
     if (!res.headersSent) {
-      res.status(500).json({ error: err instanceof Error ? err.message : 'Video content failed' });
+      res.status(500).json({ error: sanitizeError(err instanceof Error ? err.message : null, 500, 'video-result') });
     }
   }
 }

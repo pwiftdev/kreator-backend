@@ -2,6 +2,7 @@ import type { Request, Response } from 'express';
 import sharp from 'sharp';
 import { createClient } from '@supabase/supabase-js';
 import { createJob, getJob, setJobError, setJobResult, setJobRunning } from '../jobs.js';
+import { sanitizeError } from '../utils/sanitize-error.js';
 
 const LAOZHANG_API_KEY = process.env.LAOZHANG_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -239,14 +240,13 @@ async function doGenerate(body: GenerateBody): Promise<GenerateResult> {
     }
 
     if (!laoRes) {
-      throw lastError ?? new Error('No response from LaoZhang');
+      throw lastError ?? new Error('Our AI provider is temporarily unavailable. Please try again in a few minutes.');
     }
 
     if (!laoRes.ok) {
       const errorData = (await laoRes.json().catch(() => ({}))) as { error?: { message?: string } };
-      const errMsg = errorData.error?.message || `LaoZhang API error: ${laoRes.status} ${laoRes.statusText}`;
-      console.error('[generate] LaoZhang API error:', laoRes.status, errMsg);
-      throw new Error(errMsg);
+      const rawMsg = errorData.error?.message || `${laoRes.status} ${laoRes.statusText}`;
+      throw new Error(sanitizeError(rawMsg, laoRes.status, 'generate'));
     }
 
     const result = (await laoRes.json()) as {
@@ -257,8 +257,8 @@ async function doGenerate(body: GenerateBody): Promise<GenerateResult> {
     const base64Data = result.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
 
     if (!base64Data) {
-      console.error('[generate] No image data in LaoZhang response');
-      throw new Error('No image data returned from LaoZhang API');
+      console.error('[generate] No image data in upstream response');
+      throw new Error('Image generation failed — no image was returned. Please try again.');
     }
 
     const elapsed = Date.now() - startTime;
@@ -442,7 +442,8 @@ export async function generateHandler(req: Request, res: Response): Promise<void
       await setJobResult(jobId, result);
     } catch (error) {
       console.error('[generate] Job failed:', error);
-      await setJobError(jobId, error instanceof Error ? error.message : 'Generation failed');
+      const msg = sanitizeError(error instanceof Error ? error.message : null, 500, 'generate');
+      await setJobError(jobId, msg);
     }
   })();
 

@@ -1,4 +1,5 @@
 import type { Request, Response } from 'express';
+import { sanitizeError } from '../utils/sanitize-error.js';
 
 const LAOZHANG_API_KEY = process.env.LAOZHANG_API_KEY;
 const LAOZHANG_API_URL = process.env.LAOZHANG_API_URL || 'https://api.laozhang.ai';
@@ -88,16 +89,15 @@ export async function enhancePromptHandler(req: Request, res: Response): Promise
 
     if (!response.ok) {
       const errText = await response.text();
-      let errMsg = `API error: ${response.status}`;
+      let rawMsg = `API error: ${response.status}`;
       try {
         const errData = JSON.parse(errText) as { error?: { message?: string } | string };
         const err = errData.error;
-        errMsg = String(typeof err === 'object' ? err?.message ?? errMsg : err ?? errMsg);
+        rawMsg = String(typeof err === 'object' ? err?.message ?? rawMsg : err ?? rawMsg);
       } catch {
-        if (errText) errMsg = errText.slice(0, 200);
+        if (errText) rawMsg = errText;
       }
-      console.error('[enhance-prompt] LaoZhang API error:', response.status, errMsg);
-      res.status(500).json({ error: errMsg });
+      res.status(500).json({ error: sanitizeError(rawMsg, response.status, 'enhance-prompt') });
       return;
     }
 
@@ -124,7 +124,7 @@ export async function enhancePromptHandler(req: Request, res: Response): Promise
   } catch (error) {
     console.error('[enhance-prompt] Unexpected error:', error);
     res.status(500).json({
-      error: error instanceof Error ? error.message : 'Failed to enhance prompt',
+      error: sanitizeError(error instanceof Error ? error.message : null, 500, 'enhance-prompt'),
     });
   }
 }

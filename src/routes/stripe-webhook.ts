@@ -1,6 +1,6 @@
 import type { Request, Response } from 'express';
 import Stripe from 'stripe';
-import { createClient } from '@supabase/supabase-js';
+import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
@@ -8,23 +8,314 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 /**
- * Map Stripe Payment Link amounts (in cents) to credit packages.
- * Update these if you change your Payment Link prices.
+ * Map Stripe amounts (in cents) to credit packages.
+ * Keep in sync with the subscription prices in Stripe Dashboard.
  */
 const AMOUNT_TO_CREDITS: Record<number, { credits: number; plan: string }> = {
-  1900: { credits: 200, plan: 'Starter' },
-  3500: { credits: 400, plan: 'Kreator' },
-  8500: { credits: 1000, plan: 'Agency' },
+  1100: { credits: 100, plan: 'Starter' },
+  3900: { credits: 500, plan: 'Kreator' },
+  9500: { credits: 1500, plan: 'Agency' },
 };
 
 function getCreditsForAmount(amountCents: number): { credits: number; plan: string } | null {
   return AMOUNT_TO_CREDITS[amountCents] ?? null;
 }
 
+async function getUserByCustomerId(supabase: SupabaseClient, customerId: string): Promise<string | null> {
+  const { data } = await supabase
+    .from('profiles')
+    .select('id')
+    .eq('stripe_customer_id', customerId)
+    .maybeSingle();
+  return data?.id ?? null;
+}
+
+/**
+ * Handle checkout.session.completed — initial subscription purchase.
+ * Uses client_reference_id to link the Stripe customer to our user.
+ */
+async function handleCheckoutCompleted(
+  stripe: Stripe,
+  supabase: SupabaseClient,
+  session: Stripe.Checkout.Session
+): Promise<void> {
+  const userId = session.client_reference_id;
+  const sessionId = session.id;
+  const amountTotal = session.amount_total;
+  const currency = session.currency ?? 'usd';
+
+  if (!userId) {
+    console.error('[stripe] No client_reference_id on session', sessionId);
+    return;
+  }
+
+  const customerId = typeof session.customer === 'string'
+    ? session.customer
+    : session.customer?.id;
+
+  const subscriptionId = typeof session.subscription === 'string'
+    ? session.subscription
+    : session.subscription?.id;
+
+  // Save Stripe customer + subscription info on the user's profile
+  const profileUpdate: Record<string, unknown> = {
+    updated_at: new Date().toISOString(),
+  };
+  if (customerId) profileUpdate.stripe_customer_id = customerId;
+  if (subscriptionId) profileUpdate.stripe_subscription_id = subscriptionId;
+
+  // Fetch subscription to get plan details and period end
+  let planName: string | null = null;
+  if (subscriptionId) {
+    try {
+      const sub = await stripe.subscriptions.retrieve(subscriptionId);
+      profileUpdate.subscription_status = sub.status;
+      const periodEnd = sub.items.data[0]?.current_period_end;
+      if (periodEnd) {
+        profileUpdate.subscription_current_period_end = new Date(periodEnd * 1000).toISOString();
+      }
+
+      const pack = amountTotal ? getCreditsForAmount(amountTotal) : null;
+      if (pack) {
+        planName = pack.plan;
+        profileUpdate.subscription_plan = pack.plan.toLowerCase();
+      }
+    } catch (err) {
+      console.warn('[stripe] Failed to fetch subscription details:', err);
+      profileUpdate.subscription_status = 'active';
+    }
+  } else {
+    profileUpdate.subscription_status = 'active';
+  }
+
+  const { error: updateErr } = await supabase
+    .from('profiles')
+    .update(profileUpdate)
+    .eq('id', userId);
+
+  if (updateErr) {
+    console.error('[stripe] Failed to update profile with subscription:', updateErr);
+  }
+
+  // Add credits + log (same as before, with idempotency)
+  if (!amountTotal || amountTotal <= 0) {
+    console.warn('[stripe] No amount_total on checkout session', sessionId);
+    return;
+  }
+
+  const pack = getCreditsForAmount(amountTotal);
+  if (!pack) {
+    console.error('[stripe] Unknown amount:', amountTotal, 'cents. Session:', sessionId);
+    return;
+  }
+
+  const { data: existing } = await supabase
+    .from('credit_purchases')
+    .select('id')
+    .eq('stripe_session_id', sessionId)
+    .maybeSingle();
+
+  if (existing) {
+    console.log('[stripe] Already processed session', sessionId);
+    return;
+  }
+
+  const { data: newBalance, error: addErr } = await supabase
+    .rpc('add_credits', { p_user_id: userId, p_amount: pack.credits });
+
+  if (addErr) {
+    console.error('[stripe] add_credits failed:', addErr);
+    return;
+  }
+
+  const { error: logErr } = await supabase
+    .rpc('log_credit_purchase', {
+      p_user_id: userId,
+      p_credits: pack.credits,
+      p_amount_cents: amountTotal,
+      p_currency: currency,
+      p_stripe_session_id: sessionId,
+      p_plan_name: planName ?? pack.plan,
+    });
+
+  if (logErr) {
+    console.warn('[stripe] log_credit_purchase failed (credits were added):', logErr);
+  }
+
+  console.log(
+    `[stripe] ✓ Checkout ${pack.plan}: +${pack.credits} credits for user ${userId} (balance: ${newBalance}). Session: ${sessionId}`
+  );
+}
+
+/**
+ * Handle invoice.payment_succeeded — monthly renewal credit top-up.
+ * Skips the first invoice (already handled by checkout).
+ */
+async function handleInvoiceSucceeded(
+  supabase: SupabaseClient,
+  invoice: Stripe.Invoice
+): Promise<void> {
+  if (invoice.billing_reason === 'subscription_create') {
+    console.log('[stripe] Skipping first invoice (handled by checkout):', invoice.id);
+    return;
+  }
+
+  const customerId = typeof invoice.customer === 'string'
+    ? invoice.customer
+    : invoice.customer?.id;
+
+  if (!customerId) {
+    console.error('[stripe] No customer on invoice', invoice.id);
+    return;
+  }
+
+  const userId = await getUserByCustomerId(supabase, customerId);
+  if (!userId) {
+    console.error('[stripe] No user found for customer', customerId, 'invoice', invoice.id);
+    return;
+  }
+
+  const amountPaid = invoice.amount_paid;
+  const currency = invoice.currency ?? 'usd';
+
+  if (!amountPaid || amountPaid <= 0) {
+    console.warn('[stripe] Zero/negative amount on invoice', invoice.id);
+    return;
+  }
+
+  const pack = getCreditsForAmount(amountPaid);
+  if (!pack) {
+    console.error('[stripe] Unknown renewal amount:', amountPaid, 'cents. Invoice:', invoice.id);
+    return;
+  }
+
+  // Idempotency: use invoice ID as session ID for dedup
+  const dedup = `inv_${invoice.id}`;
+  const { data: existing } = await supabase
+    .from('credit_purchases')
+    .select('id')
+    .eq('stripe_session_id', dedup)
+    .maybeSingle();
+
+  if (existing) {
+    console.log('[stripe] Already processed invoice', invoice.id);
+    return;
+  }
+
+  const { data: newBalance, error: addErr } = await supabase
+    .rpc('add_credits', { p_user_id: userId, p_amount: pack.credits });
+
+  if (addErr) {
+    console.error('[stripe] add_credits failed for renewal:', addErr);
+    return;
+  }
+
+  const { error: logErr } = await supabase
+    .rpc('log_credit_purchase', {
+      p_user_id: userId,
+      p_credits: pack.credits,
+      p_amount_cents: amountPaid,
+      p_currency: currency,
+      p_stripe_session_id: dedup,
+      p_plan_name: `${pack.plan} (renewal)`,
+    });
+
+  if (logErr) {
+    console.warn('[stripe] log_credit_purchase failed for renewal:', logErr);
+  }
+
+  console.log(
+    `[stripe] ✓ Renewal ${pack.plan}: +${pack.credits} credits for user ${userId} (balance: ${newBalance}). Invoice: ${invoice.id}`
+  );
+}
+
+/**
+ * Handle customer.subscription.updated — status/plan changes.
+ */
+async function handleSubscriptionUpdated(
+  supabase: SupabaseClient,
+  subscription: Stripe.Subscription
+): Promise<void> {
+  const customerId = typeof subscription.customer === 'string'
+    ? subscription.customer
+    : subscription.customer?.id;
+
+  if (!customerId) return;
+
+  const userId = await getUserByCustomerId(supabase, customerId);
+  if (!userId) {
+    console.error('[stripe] No user for customer', customerId, 'sub', subscription.id);
+    return;
+  }
+
+  const amountCents = subscription.items.data[0]?.price?.unit_amount;
+  const pack = amountCents ? getCreditsForAmount(amountCents) : null;
+
+  const periodEnd = subscription.items.data[0]?.current_period_end;
+  const updatePayload: Record<string, unknown> = {
+    subscription_status: subscription.status,
+    stripe_subscription_id: subscription.id,
+    updated_at: new Date().toISOString(),
+  };
+  if (periodEnd) {
+    updatePayload.subscription_current_period_end = new Date(periodEnd * 1000).toISOString();
+  }
+  if (pack) {
+    updatePayload.subscription_plan = pack.plan.toLowerCase();
+  }
+
+  const { error } = await supabase
+    .from('profiles')
+    .update(updatePayload)
+    .eq('id', userId);
+
+  if (error) {
+    console.error('[stripe] Failed to update subscription status:', error);
+  } else {
+    console.log(`[stripe] ✓ Subscription updated for user ${userId}: status=${subscription.status}`);
+  }
+}
+
+/**
+ * Handle customer.subscription.deleted — cancellation.
+ * Credits remain untouched; user can spend them until 0.
+ */
+async function handleSubscriptionDeleted(
+  supabase: SupabaseClient,
+  subscription: Stripe.Subscription
+): Promise<void> {
+  const customerId = typeof subscription.customer === 'string'
+    ? subscription.customer
+    : subscription.customer?.id;
+
+  if (!customerId) return;
+
+  const userId = await getUserByCustomerId(supabase, customerId);
+  if (!userId) {
+    console.error('[stripe] No user for customer', customerId, 'sub', subscription.id);
+    return;
+  }
+
+  const { error } = await supabase
+    .from('profiles')
+    .update({
+      subscription_status: 'cancelled',
+      stripe_subscription_id: null,
+      subscription_plan: null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', userId);
+
+  if (error) {
+    console.error('[stripe] Failed to mark subscription cancelled:', error);
+  } else {
+    console.log(`[stripe] ✓ Subscription cancelled for user ${userId}. Credits kept.`);
+  }
+}
+
 /**
  * POST /api/stripe/webhook
- * Stripe sends checkout.session.completed events here after Payment Link purchase.
- * We verify the signature, extract user ID from client_reference_id, and add credits.
+ * Handles subscription lifecycle events from Stripe.
  */
 export async function stripeWebhookHandler(req: Request, res: Response): Promise<void> {
   if (!STRIPE_SECRET_KEY || !STRIPE_WEBHOOK_SECRET) {
@@ -48,7 +339,6 @@ export async function stripeWebhookHandler(req: Request, res: Response): Promise
 
   let event: Stripe.Event;
   try {
-    // req.body must be the raw buffer for signature verification
     event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
   } catch (err) {
     console.error('[stripe] Signature verification failed:', err);
@@ -56,83 +346,39 @@ export async function stripeWebhookHandler(req: Request, res: Response): Promise
     return;
   }
 
-  if (event.type !== 'checkout.session.completed') {
-    // Acknowledge other events without processing
-    res.status(200).json({ received: true });
-    return;
-  }
-
-  const session = event.data.object as Stripe.Checkout.Session;
-  const userId = session.client_reference_id;
-  const amountTotal = session.amount_total;
-  const currency = session.currency ?? 'usd';
-  const sessionId = session.id;
-
-  if (!userId) {
-    console.error('[stripe] No client_reference_id on session', sessionId);
-    res.status(400).json({ error: 'No user ID in session' });
-    return;
-  }
-
-  if (!amountTotal || amountTotal <= 0) {
-    console.error('[stripe] Invalid amount_total', amountTotal, 'session', sessionId);
-    res.status(400).json({ error: 'Invalid amount' });
-    return;
-  }
-
-  const pack = getCreditsForAmount(amountTotal);
-  if (!pack) {
-    console.error('[stripe] Unknown amount:', amountTotal, 'cents. Session:', sessionId);
-    res.status(400).json({ error: `Unknown payment amount: ${amountTotal}` });
-    return;
-  }
-
   const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
   try {
-    // Idempotency: check if we already processed this session
-    const { data: existing } = await supabase
-      .from('credit_purchases')
-      .select('id')
-      .eq('stripe_session_id', sessionId)
-      .maybeSingle();
+    switch (event.type) {
+      case 'checkout.session.completed': {
+        const session = event.data.object as Stripe.Checkout.Session;
+        await handleCheckoutCompleted(stripe, supabase, session);
+        break;
+      }
 
-    if (existing) {
-      console.log('[stripe] Already processed session', sessionId);
-      res.status(200).json({ received: true, already_processed: true });
-      return;
+      case 'invoice.payment_succeeded': {
+        const invoice = event.data.object as Stripe.Invoice;
+        await handleInvoiceSucceeded(supabase, invoice);
+        break;
+      }
+
+      case 'customer.subscription.updated': {
+        const subscription = event.data.object as Stripe.Subscription;
+        await handleSubscriptionUpdated(supabase, subscription);
+        break;
+      }
+
+      case 'customer.subscription.deleted': {
+        const subscription = event.data.object as Stripe.Subscription;
+        await handleSubscriptionDeleted(supabase, subscription);
+        break;
+      }
+
+      default:
+        console.log('[stripe] Unhandled event type:', event.type);
     }
 
-    // Add credits
-    const { data: newBalance, error: addErr } = await supabase
-      .rpc('add_credits', { p_user_id: userId, p_amount: pack.credits });
-
-    if (addErr) {
-      console.error('[stripe] add_credits failed:', addErr);
-      res.status(500).json({ error: 'Failed to add credits' });
-      return;
-    }
-
-    // Log the purchase
-    const { error: logErr } = await supabase
-      .rpc('log_credit_purchase', {
-        p_user_id: userId,
-        p_credits: pack.credits,
-        p_amount_cents: amountTotal,
-        p_currency: currency,
-        p_stripe_session_id: sessionId,
-        p_plan_name: pack.plan,
-      });
-
-    if (logErr) {
-      console.warn('[stripe] log_credit_purchase failed (credits were added):', logErr);
-    }
-
-    console.log(
-      `[stripe] ✓ ${pack.plan}: +${pack.credits} credits for user ${userId} (balance: ${newBalance}). Session: ${sessionId}`
-    );
-
-    res.status(200).json({ received: true, credits_added: pack.credits });
+    res.status(200).json({ received: true });
   } catch (err) {
     console.error('[stripe] Processing error:', err);
     if (!res.headersSent) {

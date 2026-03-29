@@ -6,6 +6,7 @@ import { generateHandler, generateStatusHandler } from './routes/generate.js';
 import { enhancePromptHandler } from './routes/enhance-prompt.js';
 import { videoGenerateHandler, videoStatusHandler, videoResultHandler } from './routes/video.js';
 import { stripeWebhookHandler } from './routes/stripe-webhook.js';
+import { stripePortalHandler } from './routes/stripe-portal.js';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -68,6 +69,7 @@ app.post('/api/enhance-prompt', enhancePromptHandler);
 app.post('/api/video/generate', videoGenerateHandler);
 app.get('/api/video/status/:taskId', videoStatusHandler);
 app.get('/api/video/result/:taskId', videoResultHandler);
+app.post('/api/stripe/portal', stripePortalHandler);
 
 app.listen(PORT, () => {
   console.log(`[start] kreator-backend listening on port ${PORT}`);
