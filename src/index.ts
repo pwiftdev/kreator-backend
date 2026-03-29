@@ -5,11 +5,15 @@ import cors from 'cors';
 import { generateHandler, generateStatusHandler } from './routes/generate.js';
 import { enhancePromptHandler } from './routes/enhance-prompt.js';
 import { videoGenerateHandler, videoStatusHandler, videoResultHandler } from './routes/video.js';
+import { stripeWebhookHandler } from './routes/stripe-webhook.js';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Trust reverse proxy (Heroku, etc.) so req.protocol is correct for proxy URLs
 app.set('trust proxy', 1);
+
+// Stripe webhook needs raw body for signature verification — must be before express.json()
+app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), stripeWebhookHandler);
 
 // 50MB limit - handles large base64 reference images (Vercel's 4.5MB was the bottleneck)
 app.use(express.json({ limit: '50mb' }));
