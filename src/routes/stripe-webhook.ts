@@ -160,6 +160,12 @@ async function handleInvoiceSucceeded(
     return;
   }
 
+  // Prorated invoices from plan changes are handled by subscription.updated
+  if (invoice.billing_reason === 'subscription_update') {
+    console.log('[stripe] Skipping prorated invoice (handled by subscription.updated):', invoice.id);
+    return;
+  }
+
   const customerId = typeof invoice.customer === 'string'
     ? invoice.customer
     : invoice.customer?.id;
@@ -231,6 +237,7 @@ async function handleInvoiceSucceeded(
 
 /**
  * Handle customer.subscription.updated — status/plan changes.
+ * When the plan changes (upgrade/downgrade), grant the credit difference for upgrades.
  */
 async function handleSubscriptionUpdated(
   supabase: SupabaseClient,
@@ -249,7 +256,18 @@ async function handleSubscriptionUpdated(
   }
 
   const amountCents = subscription.items.data[0]?.price?.unit_amount;
-  const pack = amountCents ? getCreditsForAmount(amountCents) : null;
+  const newPack = amountCents ? getCreditsForAmount(amountCents) : null;
+
+  // Fetch current plan to detect changes
+  const { data: currentProfile } = await supabase
+    .from('profiles')
+    .select('subscription_plan')
+    .eq('id', userId)
+    .maybeSingle();
+
+  const oldPlanId = currentProfile?.subscription_plan;
+  const newPlanId = newPack?.plan.toLowerCase() ?? null;
+  const planChanged = newPlanId && oldPlanId && newPlanId !== oldPlanId;
 
   const periodEnd = subscription.items.data[0]?.current_period_end;
   const updatePayload: Record<string, unknown> = {
@@ -260,8 +278,8 @@ async function handleSubscriptionUpdated(
   if (periodEnd) {
     updatePayload.subscription_current_period_end = new Date(periodEnd * 1000).toISOString();
   }
-  if (pack) {
-    updatePayload.subscription_plan = pack.plan.toLowerCase();
+  if (newPack) {
+    updatePayload.subscription_plan = newPack.plan.toLowerCase();
   }
 
   const { error } = await supabase
@@ -271,6 +289,40 @@ async function handleSubscriptionUpdated(
 
   if (error) {
     console.error('[stripe] Failed to update subscription status:', error);
+    return;
+  }
+
+  // On upgrade, grant the difference in credits immediately
+  if (planChanged && newPack) {
+    const oldPack = Object.values(AMOUNT_TO_CREDITS).find(
+      (p) => p.plan.toLowerCase() === oldPlanId
+    );
+    const oldCredits = oldPack?.credits ?? 0;
+    const creditDiff = newPack.credits - oldCredits;
+
+    if (creditDiff > 0) {
+      const dedup = `plan_change_${subscription.id}_${Date.now()}`;
+      const { data: newBalance, error: addErr } = await supabase
+        .rpc('add_credits', { p_user_id: userId, p_amount: creditDiff });
+
+      if (addErr) {
+        console.error('[stripe] add_credits failed for plan upgrade:', addErr);
+      } else {
+        await supabase.rpc('log_credit_purchase', {
+          p_user_id: userId,
+          p_credits: creditDiff,
+          p_amount_cents: 0,
+          p_currency: 'usd',
+          p_stripe_session_id: dedup,
+          p_plan_name: `Upgrade to ${newPack.plan}`,
+        });
+        console.log(
+          `[stripe] ✓ Plan upgrade ${oldPlanId} → ${newPlanId}: +${creditDiff} credits for user ${userId} (balance: ${newBalance})`
+        );
+      }
+    } else {
+      console.log(`[stripe] Plan downgrade ${oldPlanId} → ${newPlanId} for user ${userId}. No extra credits.`);
+    }
   } else {
     console.log(`[stripe] ✓ Subscription updated for user ${userId}: status=${subscription.status}`);
   }
