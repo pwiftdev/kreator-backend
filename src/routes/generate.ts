@@ -442,8 +442,19 @@ export async function generateHandler(req: Request, res: Response): Promise<void
       await setJobResult(jobId, result);
     } catch (error) {
       console.error('[generate] Job failed:', error);
+      // Refund the credit since generation failed
+      let refunded = false;
+      if (userId && typeof userId === 'string' && supabase) {
+        try {
+          await supabase.rpc('add_credits', { p_user_id: userId, p_amount: amount });
+          refunded = true;
+          console.log(`[generate] Refunded ${amount} credit(s) to user ${userId}`);
+        } catch (refundErr) {
+          console.error('[generate] Failed to refund credits:', refundErr);
+        }
+      }
       const msg = sanitizeError(error instanceof Error ? error.message : null, 500, 'generate');
-      await setJobError(jobId, msg);
+      await setJobError(jobId, refunded ? `${msg} [CREDITS_REFUNDED]` : msg);
     }
   })();
 
