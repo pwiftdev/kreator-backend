@@ -21,6 +21,40 @@ function getCreditsForAmount(amountCents: number): { credits: number; plan: stri
   return AMOUNT_TO_CREDITS[amountCents] ?? null;
 }
 
+/**
+ * List price in cents for the first subscription item. Requires
+ * `stripe.subscriptions.retrieve(..., { expand: ['items.data.price'] })` so
+ * `price` is a Price object, not an id. Coupons do not change this; they only
+ * change amount_total / amount_paid.
+ */
+function getListUnitAmountCentsFromSubscription(
+  sub: Stripe.Subscription
+): number | null {
+  const first = sub.items.data[0];
+  const p = first?.price;
+  if (p == null) return null;
+  if (typeof p === 'string') return null;
+  if ('deleted' in p && p.deleted) return null;
+  return p.unit_amount ?? null;
+}
+
+/** Resolves which subscription a renewal invoice belongs to (Stripe v21+ uses `parent`, not a top-level field). */
+function getSubscriptionIdFromInvoice(invoice: Stripe.Invoice): string | null {
+  const p = invoice.parent;
+  if (p?.type === 'subscription_details' && p.subscription_details) {
+    const s = p.subscription_details.subscription;
+    if (s) {
+      return typeof s === 'string' ? s : s.id;
+    }
+  }
+  const line0 = invoice.lines?.data[0];
+  if (line0?.subscription) {
+    const s = line0.subscription;
+    return typeof s === 'string' ? s : s.id;
+  }
+  return null;
+}
+
 async function getUserByCustomerId(supabase: SupabaseClient, customerId: string): Promise<string | null> {
   const { data } = await supabase
     .from('profiles')
@@ -64,21 +98,28 @@ async function handleCheckoutCompleted(
   if (customerId) profileUpdate.stripe_customer_id = customerId;
   if (subscriptionId) profileUpdate.stripe_subscription_id = subscriptionId;
 
-  // Fetch subscription to get plan details and period end
+  // Fetch subscription to get plan (from list price) and period end
   let planName: string | null = null;
+  let packFromListPrice: { credits: number; plan: string } | null = null;
   if (subscriptionId) {
     try {
-      const sub = await stripe.subscriptions.retrieve(subscriptionId);
+      const sub = await stripe.subscriptions.retrieve(subscriptionId, {
+        expand: ['items.data.price'],
+      });
       profileUpdate.subscription_status = sub.status;
       const periodEnd = sub.items.data[0]?.current_period_end;
       if (periodEnd) {
         profileUpdate.subscription_current_period_end = new Date(periodEnd * 1000).toISOString();
       }
 
-      const pack = amountTotal ? getCreditsForAmount(amountTotal) : null;
-      if (pack) {
-        planName = pack.plan;
-        profileUpdate.subscription_plan = pack.plan.toLowerCase();
+      const listCents = getListUnitAmountCentsFromSubscription(sub);
+      if (listCents != null) {
+        const pack = getCreditsForAmount(listCents);
+        if (pack) {
+          planName = pack.plan;
+          profileUpdate.subscription_plan = pack.plan.toLowerCase();
+          packFromListPrice = pack;
+        }
       }
     } catch (err) {
       console.warn('[stripe] Failed to fetch subscription details:', err);
@@ -97,15 +138,17 @@ async function handleCheckoutCompleted(
     console.error('[stripe] Failed to update profile with subscription:', updateErr);
   }
 
-  // Add credits + log (same as before, with idempotency)
-  if (!amountTotal || amountTotal <= 0) {
-    console.warn('[stripe] No amount_total on checkout session', sessionId);
-    return;
-  }
-
-  const pack = getCreditsForAmount(amountTotal);
+  // Add credits: use list price from the subscription (ignores % coupons). Fallback to amount_total
+  // for one-time checkouts that match a map key exactly.
+  const pack = packFromListPrice
+    ?? (amountTotal && amountTotal > 0 ? getCreditsForAmount(amountTotal) : null);
   if (!pack) {
-    console.error('[stripe] Unknown amount:', amountTotal, 'cents. Session:', sessionId);
+    console.error(
+      '[stripe] Could not map plan/credits for checkout. Session:',
+      sessionId,
+      'amount_total:',
+      amountTotal
+    );
     return;
   }
 
@@ -132,7 +175,7 @@ async function handleCheckoutCompleted(
     .rpc('log_credit_purchase', {
       p_user_id: userId,
       p_credits: pack.credits,
-      p_amount_cents: amountTotal,
+      p_amount_cents: amountTotal ?? 0,
       p_currency: currency,
       p_stripe_session_id: sessionId,
       p_plan_name: planName ?? pack.plan,
@@ -152,6 +195,7 @@ async function handleCheckoutCompleted(
  * Skips the first invoice (already handled by checkout).
  */
 async function handleInvoiceSucceeded(
+  stripe: Stripe,
   supabase: SupabaseClient,
   invoice: Stripe.Invoice
 ): Promise<void> {
@@ -184,15 +228,42 @@ async function handleInvoiceSucceeded(
   const amountPaid = invoice.amount_paid;
   const currency = invoice.currency ?? 'usd';
 
-  if (!amountPaid || amountPaid <= 0) {
-    console.warn('[stripe] Zero/negative amount on invoice', invoice.id);
+  const subscriptionId = getSubscriptionIdFromInvoice(invoice);
+
+  let pack: { credits: number; plan: string } | null = null;
+  if (subscriptionId) {
+    try {
+      const sub = await stripe.subscriptions.retrieve(subscriptionId, {
+        expand: ['items.data.price'],
+      });
+      const listCents = getListUnitAmountCentsFromSubscription(sub);
+      if (listCents != null) {
+        pack = getCreditsForAmount(listCents);
+      }
+    } catch (err) {
+      console.warn('[stripe] Failed to fetch subscription for renewal credits:', err);
+    }
+  }
+  if (!pack && amountPaid && amountPaid > 0) {
+    pack = getCreditsForAmount(amountPaid);
+  }
+  if (!pack) {
+    console.error(
+      '[stripe] Could not map renewal plan/credits. Invoice:',
+      invoice.id,
+      'amount_paid:',
+      amountPaid,
+      'subscription:',
+      subscriptionId
+    );
     return;
   }
 
-  const pack = getCreditsForAmount(amountPaid);
-  if (!pack) {
-    console.error('[stripe] Unknown renewal amount:', amountPaid, 'cents. Invoice:', invoice.id);
-    return;
+  if (!amountPaid || amountPaid <= 0) {
+    console.warn(
+      '[stripe] Zero amount_paid on invoice; granting credits from list price. Invoice:',
+      invoice.id
+    );
   }
 
   // Idempotency: use invoice ID as session ID for dedup
@@ -220,7 +291,7 @@ async function handleInvoiceSucceeded(
     .rpc('log_credit_purchase', {
       p_user_id: userId,
       p_credits: pack.credits,
-      p_amount_cents: amountPaid,
+      p_amount_cents: amountPaid ?? 0,
       p_currency: currency,
       p_stripe_session_id: dedup,
       p_plan_name: `${pack.plan} (renewal)`,
@@ -240,6 +311,7 @@ async function handleInvoiceSucceeded(
  * When the plan changes (upgrade/downgrade), grant the credit difference for upgrades.
  */
 async function handleSubscriptionUpdated(
+  stripe: Stripe,
   supabase: SupabaseClient,
   subscription: Stripe.Subscription
 ): Promise<void> {
@@ -255,8 +327,28 @@ async function handleSubscriptionUpdated(
     return;
   }
 
-  const amountCents = subscription.items.data[0]?.price?.unit_amount;
-  const newPack = amountCents ? getCreditsForAmount(amountCents) : null;
+  let newPack: { credits: number; plan: string } | null = null;
+  try {
+    const full = await stripe.subscriptions.retrieve(subscription.id, {
+      expand: ['items.data.price'],
+    });
+    const listCents = getListUnitAmountCentsFromSubscription(full);
+    if (listCents != null) {
+      newPack = getCreditsForAmount(listCents);
+    }
+  } catch (err) {
+    console.warn('[stripe] Could not re-fetch subscription for plan change:', err);
+  }
+  if (!newPack) {
+    const amountCents = subscription.items.data[0]?.price
+      && typeof subscription.items.data[0].price === 'object' &&
+        !('deleted' in subscription.items.data[0].price)
+      ? (subscription.items.data[0].price as Stripe.Price).unit_amount
+      : null;
+    if (amountCents != null) {
+      newPack = getCreditsForAmount(amountCents);
+    }
+  }
 
   // Fetch current plan to detect changes
   const { data: currentProfile } = await supabase
@@ -410,13 +502,13 @@ export async function stripeWebhookHandler(req: Request, res: Response): Promise
 
       case 'invoice.payment_succeeded': {
         const invoice = event.data.object as Stripe.Invoice;
-        await handleInvoiceSucceeded(supabase, invoice);
+        await handleInvoiceSucceeded(stripe, supabase, invoice);
         break;
       }
 
       case 'customer.subscription.updated': {
         const subscription = event.data.object as Stripe.Subscription;
-        await handleSubscriptionUpdated(supabase, subscription);
+        await handleSubscriptionUpdated(stripe, supabase, subscription);
         break;
       }
 
