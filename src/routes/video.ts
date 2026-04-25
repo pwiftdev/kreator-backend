@@ -4,7 +4,11 @@ import { createClient } from '@supabase/supabase-js';
 import { sanitizeError } from '../utils/sanitize-error.js';
 
 const LAOZHANG_API_KEY = process.env.LAOZHANG_API_KEY;
-const LAOZHANG_API_URL = process.env.LAOZHANG_API_URL || 'https://api.laozhang.ai';
+const LAOZHANG_PRIMARY_API_URL = process.env.LAOZHANG_API_URL || 'https://api-vip.laozhang.ai';
+const LAOZHANG_FALLBACK_API_URL = process.env.LAOZHANG_FALLBACK_API_URL || 'https://api.laozhang.ai';
+const LAOZHANG_API_URLS = [LAOZHANG_PRIMARY_API_URL, LAOZHANG_FALLBACK_API_URL];
+const LAOZHANG_MAX_RETRIES = 3;
+const LAOZHANG_RETRY_DELAY_MS = 1500;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
@@ -42,6 +46,32 @@ async function getImageBuffer(imageUrl: string): Promise<{ buffer: Buffer; mime:
   const buf = Buffer.from(await res.arrayBuffer());
   const ct = res.headers.get('content-type') || 'image/png';
   return { buffer: buf, mime: ct.split(';')[0].trim() };
+}
+
+/** Call LaoZhang with primary + fallback domain and retries for transient failures. */
+async function fetchLaozhang(path: string, init: RequestInit): Promise<globalThis.Response> {
+  let lastRes: globalThis.Response | null = null;
+  let lastErr: unknown = null;
+  for (let attempt = 1; attempt <= LAOZHANG_MAX_RETRIES; attempt++) {
+    for (const baseUrl of LAOZHANG_API_URLS) {
+      try {
+        const res = await fetch(`${baseUrl}${path}`, init);
+        lastRes = res;
+        if (res.ok || res.status < 500) {
+          return res;
+        }
+        console.warn(`[video] LaoZhang ${baseUrl} returned ${res.status} (attempt ${attempt}/${LAOZHANG_MAX_RETRIES})`);
+      } catch (err) {
+        lastErr = err;
+        console.warn(`[video] LaoZhang request failed via ${baseUrl} (attempt ${attempt}/${LAOZHANG_MAX_RETRIES})`);
+      }
+    }
+    if (attempt < LAOZHANG_MAX_RETRIES) {
+      await new Promise((r) => setTimeout(r, LAOZHANG_RETRY_DELAY_MS));
+    }
+  }
+  if (lastRes) return lastRes;
+  throw (lastErr instanceof Error ? lastErr : new Error('LaoZhang request failed'));
 }
 
 /**
@@ -103,7 +133,7 @@ export async function videoGenerateHandler(req: Request, res: Response): Promise
 
     console.log('[video] Creating Veo task, model=%s, imageSize=%d bytes', model, buffer.length);
 
-    const response = await fetch(`${LAOZHANG_API_URL}/v1/videos`, {
+    const response = await fetchLaozhang('/v1/videos', {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${LAOZHANG_API_KEY}`,
@@ -147,7 +177,7 @@ export async function videoStatusHandler(req: Request, res: Response): Promise<v
   if (!LAOZHANG_API_KEY) { res.status(500).json({ error: 'API key not configured' }); return; }
 
   try {
-    const response = await fetch(`${LAOZHANG_API_URL}/v1/videos/${taskId}`, {
+    const response = await fetchLaozhang(`/v1/videos/${taskId}`, {
       headers: { Authorization: `Bearer ${LAOZHANG_API_KEY}` },
     });
 
@@ -179,7 +209,7 @@ export async function videoResultHandler(req: Request, res: Response): Promise<v
   if (!LAOZHANG_API_KEY) { res.status(500).json({ error: 'API key not configured' }); return; }
 
   try {
-    const response = await fetch(`${LAOZHANG_API_URL}/v1/videos/${taskId}/content`, {
+    const response = await fetchLaozhang(`/v1/videos/${taskId}/content`, {
       headers: { Authorization: `Bearer ${LAOZHANG_API_KEY}` },
     });
 

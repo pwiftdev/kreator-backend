@@ -18,7 +18,9 @@ const THUMB_PATH_PREFIX = 'thumbs/';
 const REFS_PATH_PREFIX = 'refs/';
 const THUMB_WIDTH = 400;
 const THUMB_JPEG_QUALITY = 65;
-const LAOZHANG_API_URL = process.env.LAOZHANG_API_URL || 'https://api.laozhang.ai';
+const LAOZHANG_PRIMARY_API_URL = process.env.LAOZHANG_API_URL || 'https://api-vip.laozhang.ai';
+const LAOZHANG_FALLBACK_API_URL = process.env.LAOZHANG_FALLBACK_API_URL || 'https://api.laozhang.ai';
+const LAOZHANG_API_URLS = [LAOZHANG_PRIMARY_API_URL, LAOZHANG_FALLBACK_API_URL];
 
 const LAOZHANG_FETCH_TIMEOUT_MS = 180_000; // 3 min per attempt (matches LaoZhang example)
 const LAOZHANG_MAX_RETRIES = 3;
@@ -204,38 +206,52 @@ async function doGenerate(body: GenerateBody): Promise<GenerateResult> {
     let laoRes: Awaited<ReturnType<typeof fetch>> | null = null;
 
     for (let attempt = 1; attempt <= LAOZHANG_MAX_RETRIES; attempt++) {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), LAOZHANG_FETCH_TIMEOUT_MS);
+      for (const baseUrl of LAOZHANG_API_URLS) {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), LAOZHANG_FETCH_TIMEOUT_MS);
 
-      try {
-        laoRes = await fetch(
-          `${LAOZHANG_API_URL}/v1beta/models/${model}:generateContent`,
-          {
-            method: 'POST',
-            headers: {
-              Authorization: `Bearer ${LAOZHANG_API_KEY}`,
-              'Content-Type': 'application/json',
-            },
-            body: payloadStr,
-            signal: controller.signal,
+        try {
+          laoRes = await fetch(
+            `${baseUrl}/v1beta/models/${model}:generateContent`,
+            {
+              method: 'POST',
+              headers: {
+                Authorization: `Bearer ${LAOZHANG_API_KEY}`,
+                'Content-Type': 'application/json',
+              },
+              body: payloadStr,
+              signal: controller.signal,
+            }
+          );
+          clearTimeout(timeout);
+          if (laoRes.ok || laoRes.status < 500) {
+            break;
           }
-        );
-        clearTimeout(timeout);
-        break;
-      } catch (err) {
-        clearTimeout(timeout);
-        lastError = err;
-        const isRetryable =
-          err instanceof Error &&
-          (err.name === 'AbortError' ||
-            err.message?.includes('fetch failed') ||
-            (err.cause as Error)?.message?.includes('closed'));
-        if (isRetryable && attempt < LAOZHANG_MAX_RETRIES) {
-          console.warn(`[generate] LaoZhang request failed (attempt ${attempt}/${LAOZHANG_MAX_RETRIES}), retrying in ${LAOZHANG_RETRY_DELAY_MS / 1000}s...`, err instanceof Error ? err.message : err);
-          await new Promise((r) => setTimeout(r, LAOZHANG_RETRY_DELAY_MS));
-        } else {
-          throw err;
+          lastError = new Error(`HTTP ${laoRes.status} from ${baseUrl}`);
+          console.warn(`[generate] LaoZhang ${baseUrl} returned ${laoRes.status} (attempt ${attempt}/${LAOZHANG_MAX_RETRIES})`);
+        } catch (err) {
+          clearTimeout(timeout);
+          lastError = err;
+          const isRetryable =
+            err instanceof Error &&
+            (err.name === 'AbortError' ||
+              err.message?.includes('fetch failed') ||
+              (err.cause as Error)?.message?.includes('closed'));
+          if (!isRetryable) {
+            throw err;
+          }
+          console.warn(
+            `[generate] LaoZhang request failed via ${baseUrl} (attempt ${attempt}/${LAOZHANG_MAX_RETRIES})`,
+            err instanceof Error ? err.message : err
+          );
         }
+      }
+
+      if (laoRes && (laoRes.ok || laoRes.status < 500)) {
+        break;
+      }
+      if (attempt < LAOZHANG_MAX_RETRIES) {
+        await new Promise((r) => setTimeout(r, LAOZHANG_RETRY_DELAY_MS));
       }
     }
 

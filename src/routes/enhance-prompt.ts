@@ -2,7 +2,11 @@ import type { Request, Response } from 'express';
 import { sanitizeError } from '../utils/sanitize-error.js';
 
 const LAOZHANG_API_KEY = process.env.LAOZHANG_API_KEY;
-const LAOZHANG_API_URL = process.env.LAOZHANG_API_URL || 'https://api.laozhang.ai';
+const LAOZHANG_PRIMARY_API_URL = process.env.LAOZHANG_API_URL || 'https://api-vip.laozhang.ai';
+const LAOZHANG_FALLBACK_API_URL = process.env.LAOZHANG_FALLBACK_API_URL || 'https://api.laozhang.ai';
+const LAOZHANG_API_URLS = [LAOZHANG_PRIMARY_API_URL, LAOZHANG_FALLBACK_API_URL];
+const LAOZHANG_MAX_RETRIES = 3;
+const LAOZHANG_RETRY_DELAY_MS = 1500;
 const ENHANCE_MODEL = process.env.ENHANCE_PROMPT_MODEL || 'gpt-4o-mini';
 
 const SYSTEM_PROMPT = `You are an expert prompt enhancer for AI image generation.
@@ -44,6 +48,31 @@ CORE RULES:
 QUALITY STANDARD:
 Output must be a single flowing sentence with comma-separated descriptors, like professional Midjourney or DALL·E prompts.`;
 
+async function fetchLaozhang(path: string, init: RequestInit): Promise<globalThis.Response> {
+  let lastRes: globalThis.Response | null = null;
+  let lastErr: unknown = null;
+  for (let attempt = 1; attempt <= LAOZHANG_MAX_RETRIES; attempt++) {
+    for (const baseUrl of LAOZHANG_API_URLS) {
+      try {
+        const res = await fetch(`${baseUrl}${path}`, init);
+        lastRes = res;
+        if (res.ok || res.status < 500) {
+          return res;
+        }
+        console.warn(`[enhance-prompt] LaoZhang ${baseUrl} returned ${res.status} (attempt ${attempt}/${LAOZHANG_MAX_RETRIES})`);
+      } catch (err) {
+        lastErr = err;
+        console.warn(`[enhance-prompt] LaoZhang request failed via ${baseUrl} (attempt ${attempt}/${LAOZHANG_MAX_RETRIES})`);
+      }
+    }
+    if (attempt < LAOZHANG_MAX_RETRIES) {
+      await new Promise((r) => setTimeout(r, LAOZHANG_RETRY_DELAY_MS));
+    }
+  }
+  if (lastRes) return lastRes;
+  throw (lastErr instanceof Error ? lastErr : new Error('LaoZhang request failed'));
+}
+
 export async function enhancePromptHandler(req: Request, res: Response): Promise<void> {
   if (req.method !== 'POST') {
     res.status(405).json({ error: 'Method not allowed' });
@@ -70,7 +99,7 @@ export async function enhancePromptHandler(req: Request, res: Response): Promise
 
     console.log(`[enhance-prompt] Request: "${prompt.slice(0, 60)}${prompt.length > 60 ? '...' : ''}"`);
     const startTime = Date.now();
-    const response = await fetch(`${LAOZHANG_API_URL}/v1/chat/completions`, {
+    const response = await fetchLaozhang('/v1/chat/completions', {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${LAOZHANG_API_KEY}`,
