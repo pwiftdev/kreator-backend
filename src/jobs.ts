@@ -1,8 +1,8 @@
 /** Persistent job store (Supabase) for async generation - survives dyno restarts */
 
-import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { createClient, SupabaseClient } from "@supabase/supabase-js";
 
-export type JobStatus = 'pending' | 'running' | 'done' | 'error';
+export type JobStatus = "pending" | "running" | "done" | "error";
 
 export interface JobResult {
   id?: string;
@@ -27,32 +27,40 @@ function getClient(): SupabaseClient {
     const url = process.env.SUPABASE_URL;
     const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
     if (!url || !key) {
-      throw new Error('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY required for jobs');
+      throw new Error(
+        "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY required for jobs",
+      );
     }
     client = createClient(url, key);
   }
   return client;
 }
 
-export async function createJob(): Promise<string> {
-  const { data, error } = await getClient()
-    .from('generation_jobs')
-    .insert({ status: 'pending' })
-    .select('id')
-    .single();
+export async function createJob(userId: string): Promise<string> {
+  const { data, error } = await getClient().rpc("start_generation_job", {
+    p_user_id: userId,
+    p_max_concurrent: 3,
+  });
 
   if (error) {
-    console.error('[jobs] createJob failed:', error.message);
-    throw new Error('Failed to create job');
+    console.error("[jobs] createJob failed:", error.message);
+    throw new Error("Failed to create job");
   }
-  return data.id;
+  const result = data as { jobId?: string; error?: string };
+  if (result.error) throw new Error(result.error);
+  if (!result.jobId) throw new Error("Failed to create job");
+  return result.jobId;
 }
 
-export async function getJob(jobId: string): Promise<Job | undefined> {
+export async function getJob(
+  jobId: string,
+  userId: string,
+): Promise<Job | undefined> {
   const { data, error } = await getClient()
-    .from('generation_jobs')
-    .select('status, result, error_message')
-    .eq('id', jobId)
+    .from("generation_jobs")
+    .select("status, result, error_message")
+    .eq("id", jobId)
+    .eq("user_id", userId)
     .single();
 
   if (error || !data) {
@@ -67,32 +75,48 @@ export async function getJob(jobId: string): Promise<Job | undefined> {
 }
 
 export async function setJobRunning(jobId: string): Promise<void> {
-  await getClient()
-    .from('generation_jobs')
-    .update({ status: 'running', updated_at: new Date().toISOString() })
-    .eq('id', jobId);
+  const { error } = await getClient()
+    .from("generation_jobs")
+    .update({ status: "running", updated_at: new Date().toISOString() })
+    .eq("id", jobId);
+  if (error) throw new Error(`Failed to update job: ${error.message}`);
 }
 
-export async function setJobResult(jobId: string, result: JobResult): Promise<void> {
-  await getClient()
-    .from('generation_jobs')
+export async function setJobResult(
+  jobId: string,
+  result: JobResult,
+): Promise<void> {
+  const { error } = await getClient()
+    .from("generation_jobs")
     .update({
-      status: 'done',
+      status: "done",
       result,
       error_message: null,
       updated_at: new Date().toISOString(),
     })
-    .eq('id', jobId);
+    .eq("id", jobId);
+  if (error) throw new Error(`Failed to save job result: ${error.message}`);
 }
 
 export async function setJobError(jobId: string, error: string): Promise<void> {
-  await getClient()
-    .from('generation_jobs')
+  const { error: updateError } = await getClient()
+    .from("generation_jobs")
     .update({
-      status: 'error',
+      status: "error",
       error_message: error,
       result: null,
       updated_at: new Date().toISOString(),
     })
-    .eq('id', jobId);
+    .eq("id", jobId);
+  if (updateError)
+    throw new Error(`Failed to save job error: ${updateError.message}`);
+}
+
+export async function reconcileStaleJobs(): Promise<number> {
+  const { data, error } = await getClient().rpc(
+    "reconcile_stale_generation_jobs",
+  );
+  if (error)
+    throw new Error(`Failed to reconcile stale jobs: ${error.message}`);
+  return Number(data ?? 0);
 }

@@ -1,13 +1,17 @@
-import type { Request, Response } from 'express';
-import { sanitizeError } from '../utils/sanitize-error.js';
+import type { Request, Response } from "express";
+import { sanitizeError } from "../utils/sanitize-error.js";
+import { getAuthenticatedUser } from "../utils/supabase-admin.js";
+import { recordApiUsage } from "../utils/api-usage.js";
 
 const LAOZHANG_API_KEY = process.env.LAOZHANG_API_KEY;
-const LAOZHANG_PRIMARY_API_URL = process.env.LAOZHANG_API_URL || 'https://api-vip.laozhang.ai';
-const LAOZHANG_FALLBACK_API_URL = process.env.LAOZHANG_FALLBACK_API_URL || 'https://api.laozhang.ai';
+const LAOZHANG_PRIMARY_API_URL =
+  process.env.LAOZHANG_API_URL || "https://api-vip.laozhang.ai";
+const LAOZHANG_FALLBACK_API_URL =
+  process.env.LAOZHANG_FALLBACK_API_URL || "https://api.laozhang.ai";
 const LAOZHANG_API_URLS = [LAOZHANG_PRIMARY_API_URL, LAOZHANG_FALLBACK_API_URL];
 const LAOZHANG_MAX_RETRIES = 3;
 const LAOZHANG_RETRY_DELAY_MS = 1500;
-const ENHANCE_MODEL = process.env.ENHANCE_PROMPT_MODEL || 'gpt-4o-mini';
+const ENHANCE_MODEL = process.env.ENHANCE_PROMPT_MODEL || "gpt-4o-mini";
 
 const SYSTEM_PROMPT = `You are an expert prompt enhancer for AI image generation.
 
@@ -48,21 +52,31 @@ CORE RULES:
 QUALITY STANDARD:
 Output must be a single flowing sentence with comma-separated descriptors, like professional Midjourney or DALL·E prompts.`;
 
-async function fetchLaozhang(path: string, init: RequestInit): Promise<globalThis.Response> {
+async function fetchLaozhang(
+  path: string,
+  init: RequestInit,
+): Promise<globalThis.Response> {
   let lastRes: globalThis.Response | null = null;
   let lastErr: unknown = null;
   for (let attempt = 1; attempt <= LAOZHANG_MAX_RETRIES; attempt++) {
     for (const baseUrl of LAOZHANG_API_URLS) {
       try {
-        const res = await fetch(`${baseUrl}${path}`, init);
+        const res = await fetch(`${baseUrl}${path}`, {
+          ...init,
+          signal: AbortSignal.timeout(60_000),
+        });
         lastRes = res;
         if (res.ok || res.status < 500) {
           return res;
         }
-        console.warn(`[enhance-prompt] LaoZhang ${baseUrl} returned ${res.status} (attempt ${attempt}/${LAOZHANG_MAX_RETRIES})`);
+        console.warn(
+          `[enhance-prompt] LaoZhang ${baseUrl} returned ${res.status} (attempt ${attempt}/${LAOZHANG_MAX_RETRIES})`,
+        );
       } catch (err) {
         lastErr = err;
-        console.warn(`[enhance-prompt] LaoZhang request failed via ${baseUrl} (attempt ${attempt}/${LAOZHANG_MAX_RETRIES})`);
+        console.warn(
+          `[enhance-prompt] LaoZhang request failed via ${baseUrl} (attempt ${attempt}/${LAOZHANG_MAX_RETRIES})`,
+        );
       }
     }
     if (attempt < LAOZHANG_MAX_RETRIES) {
@@ -70,20 +84,32 @@ async function fetchLaozhang(path: string, init: RequestInit): Promise<globalThi
     }
   }
   if (lastRes) return lastRes;
-  throw (lastErr instanceof Error ? lastErr : new Error('LaoZhang request failed'));
+  throw lastErr instanceof Error
+    ? lastErr
+    : new Error("LaoZhang request failed");
 }
 
-export async function enhancePromptHandler(req: Request, res: Response): Promise<void> {
-  if (req.method !== 'POST') {
-    res.status(405).json({ error: 'Method not allowed' });
+export async function enhancePromptHandler(
+  req: Request,
+  res: Response,
+): Promise<void> {
+  const requestStartedAt = Date.now();
+  if (req.method !== "POST") {
+    res.status(405).json({ error: "Method not allowed" });
     return;
   }
 
-  if (!LAOZHANG_API_KEY || LAOZHANG_API_KEY === 'sk-YOUR_API_KEY_HERE') {
-    console.error('[enhance-prompt] LAOZHANG_API_KEY not set');
+  if (!LAOZHANG_API_KEY || LAOZHANG_API_KEY === "sk-YOUR_API_KEY_HERE") {
+    console.error("[enhance-prompt] LAOZHANG_API_KEY not set");
     res.status(500).json({
-      error: 'Server configuration error: LAOZHANG_API_KEY not set.',
+      error: "Server configuration error: LAOZHANG_API_KEY not set.",
     });
+    return;
+  }
+
+  const authenticatedUser = await getAuthenticatedUser(req);
+  if (!authenticatedUser) {
+    res.status(401).json({ error: "Authentication required" });
     return;
   }
 
@@ -91,25 +117,24 @@ export async function enhancePromptHandler(req: Request, res: Response): Promise
     const body = req.body as { prompt?: string };
     const prompt = body?.prompt;
 
-    if (!prompt || typeof prompt !== 'string') {
-      console.warn('[enhance-prompt] Missing or invalid prompt');
-      res.status(400).json({ error: 'Missing or invalid prompt' });
+    if (!prompt || typeof prompt !== "string" || prompt.length > 2000) {
+      console.warn("[enhance-prompt] Missing or invalid prompt");
+      res.status(400).json({ error: "Missing or invalid prompt" });
       return;
     }
 
-    console.log(`[enhance-prompt] Request: "${prompt.slice(0, 60)}${prompt.length > 60 ? '...' : ''}"`);
     const startTime = Date.now();
-    const response = await fetchLaozhang('/v1/chat/completions', {
-      method: 'POST',
+    const response = await fetchLaozhang("/v1/chat/completions", {
+      method: "POST",
       headers: {
         Authorization: `Bearer ${LAOZHANG_API_KEY}`,
-        'Content-Type': 'application/json',
+        "Content-Type": "application/json",
       },
       body: JSON.stringify({
         model: ENHANCE_MODEL,
         messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: prompt },
+          { role: "system", content: SYSTEM_PROMPT },
+          { role: "user", content: prompt },
         ],
         max_tokens: 500,
         temperature: 0.5,
@@ -120,13 +145,29 @@ export async function enhancePromptHandler(req: Request, res: Response): Promise
       const errText = await response.text();
       let rawMsg = `API error: ${response.status}`;
       try {
-        const errData = JSON.parse(errText) as { error?: { message?: string } | string };
+        const errData = JSON.parse(errText) as {
+          error?: { message?: string } | string;
+        };
         const err = errData.error;
-        rawMsg = String(typeof err === 'object' ? err?.message ?? rawMsg : err ?? rawMsg);
+        rawMsg = String(
+          typeof err === "object" ? (err?.message ?? rawMsg) : (err ?? rawMsg),
+        );
       } catch {
         if (errText) rawMsg = errText;
       }
-      res.status(500).json({ error: sanitizeError(rawMsg, response.status, 'enhance-prompt') });
+      res
+        .status(500)
+        .json({
+          error: sanitizeError(rawMsg, response.status, "enhance-prompt"),
+        });
+      await recordApiUsage({
+        userId: authenticatedUser.id,
+        endpoint: "prompt-enhancement",
+        model: ENHANCE_MODEL,
+        status: "failed",
+        creditsConsumed: 0,
+        durationMs: Date.now() - requestStartedAt,
+      });
       return;
     }
 
@@ -136,7 +177,15 @@ export async function enhancePromptHandler(req: Request, res: Response): Promise
     let enhanced = result.choices?.[0]?.message?.content?.trim();
 
     if (!enhanced) {
-      res.status(500).json({ error: 'No enhanced prompt returned' });
+      await recordApiUsage({
+        userId: authenticatedUser.id,
+        endpoint: "prompt-enhancement",
+        model: ENHANCE_MODEL,
+        status: "failed",
+        creditsConsumed: 0,
+        durationMs: Date.now() - requestStartedAt,
+      });
+      res.status(500).json({ error: "No enhanced prompt returned" });
       return;
     }
 
@@ -148,12 +197,32 @@ export async function enhancePromptHandler(req: Request, res: Response): Promise
     }
 
     const elapsed = Date.now() - startTime;
-    console.log(`[enhance-prompt] Success (${elapsed}ms): "${enhanced.slice(0, 60)}${enhanced.length > 60 ? '...' : ''}"`);
+    console.log(`[enhance-prompt] Success (${elapsed}ms)`);
+    await recordApiUsage({
+      userId: authenticatedUser.id,
+      endpoint: "prompt-enhancement",
+      model: ENHANCE_MODEL,
+      status: "success",
+      creditsConsumed: 0,
+      durationMs: elapsed,
+    });
     res.status(200).json({ enhancedPrompt: enhanced });
   } catch (error) {
-    console.error('[enhance-prompt] Unexpected error:', error);
+    console.error("[enhance-prompt] Unexpected error:", error);
+    await recordApiUsage({
+      userId: authenticatedUser.id,
+      endpoint: "prompt-enhancement",
+      model: ENHANCE_MODEL,
+      status: "failed",
+      creditsConsumed: 0,
+      durationMs: Date.now() - requestStartedAt,
+    });
     res.status(500).json({
-      error: sanitizeError(error instanceof Error ? error.message : null, 500, 'enhance-prompt'),
+      error: sanitizeError(
+        error instanceof Error ? error.message : null,
+        500,
+        "enhance-prompt",
+      ),
     });
   }
 }
